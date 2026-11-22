@@ -40,8 +40,8 @@ BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
 USER_TOKEN  = os.environ.get("USER_TOKEN", "").strip()
 CHECK_DELAY = 0.5    # secondes entre chaque check
 MAX_RESULTS = 15     # pseudos dispos max par commande
-CANDIDATES  = 150    # candidats générés par scan
-PARALLEL    = 8      # checks simultanés
+CANDIDATES  = 100    # candidats générés par scan
+PARALLEL    = 5      # checks simultanés
 PREFIX      = "+"
 
 USER_HEADERS = {
@@ -355,7 +355,8 @@ async def on_ready():
     print(f"[*] Bot connecté : {bot.user}")
     print(f"[*] Dico actif — FR: {len(ALL_FR):,} | EN: {len(ALL_EN):,}")
 
-async def run_scan(ctx, generator_fn, label: str, color: int, flag: str):
+async def run_scan(ctx, generator_fn, label: str, color: int, flag: str, limit: int = MAX_RESULTS):
+    limit = max(1, min(limit, 30))   # clamp entre 1 et 30
     # ── Embed de départ
     embed = discord.Embed(
         description=f"```\n⏳  Génération des candidats...\n```",
@@ -370,7 +371,7 @@ async def run_scan(ctx, generator_fn, label: str, color: int, flag: str):
     embed.description = f"```\n🔎  {len(candidates)} candidats — vérification...\n```"
     await msg.edit(embed=embed)
 
-    found = await scan_candidates(candidates, MAX_RESULTS, msg, label, color, flag)
+    found = await scan_candidates(candidates, limit, msg, label, color, flag)
 
     if not found:
         embed = discord.Embed(
@@ -400,6 +401,7 @@ async def scan_candidates(candidates: list[str], max_results: int, progress_msg,
     async def check_one(session, username):
         nonlocal checked
         async with sem:
+            await asyncio.sleep(0.3)   # évite le rate-limit Discord
             result = await check_available(session, username)
             checked += 1
             if result is True:
@@ -424,55 +426,174 @@ async def scan_candidates(candidates: list[str], max_results: int, progress_msg,
             if len(found) >= max_results:
                 break
             tasks.append(asyncio.create_task(check_one(session, username)))
-            if len(tasks) >= PARALLEL * 10:
+            # traiter par batch de PARALLEL*4 pour pouvoir stopper tôt
+            if len(tasks) >= PARALLEL * 4:
                 await asyncio.gather(*tasks)
                 tasks = []
                 if len(found) >= max_results:
                     break
-        if tasks:
+        if tasks and len(found) < max_results:
             await asyncio.gather(*tasks)
 
     return found[:max_results]
 
 
 @bot.command(name="meaningfr")
-async def meaning_fr(ctx):
-    await run_scan(ctx, gen_fr, "FR", 0x0055A4, "🇫🇷")
+async def meaning_fr(ctx, limit: int = MAX_RESULTS):
+    await run_scan(ctx, gen_fr, "FR", 0x0055A4, "🇫🇷", limit)
 
 @bot.command(name="meaningen")
-async def meaning_en(ctx):
-    await run_scan(ctx, gen_en, "EN", 0xED4245, "🇬🇧")
+async def meaning_en(ctx, limit: int = MAX_RESULTS):
+    await run_scan(ctx, gen_en, "EN", 0xED4245, "🇬🇧", limit)
 
 @bot.command(name="meaningmix")
-async def meaning_mix(ctx):
-    await run_scan(ctx, gen_mix, "MIX", 0x9B59B6, "🌐")
+async def meaning_mix(ctx, limit: int = MAX_RESULTS):
+    await run_scan(ctx, gen_mix, "MIX", 0x9B59B6, "🌐", limit)
+
+# ── CHECK VANITY (GET /invites/{code} — pas besoin de token) ─────────────────
+async def check_vanity(session: aiohttp.ClientSession, code: str) -> bool | None:
+    url = f"https://discord.com/api/v9/invites/{code}"
+    try:
+        async with session.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as r:
+            if r.status == 404:
+                return True   # vanity libre
+            elif r.status == 200:
+                return False  # pris
+            elif r.status == 429:
+                retry = float(r.headers.get("Retry-After", 2))
+                await asyncio.sleep(retry)
+                return None
+            else:
+                return None
+    except Exception as e:
+        print(f"[ERROR vanity] {e}")
+        return None
+
+async def scan_vanity(candidates: list[str], max_results: int, progress_msg, label: str, color: int, flag: str) -> list[str]:
+    found = []
+    checked = 0
+    sem = asyncio.Semaphore(PARALLEL)
+
+    async def check_one(session, code):
+        nonlocal checked
+        async with sem:
+            await asyncio.sleep(0.3)
+            result = await check_vanity(session, code)
+            checked += 1
+            if result is True:
+                found.append(code)
+                if len(found) % 3 == 0 or len(found) == 1:
+                    lines = "\n".join(f"> `discord.gg/{p}`" for p in found)
+                    embed = discord.Embed(
+                        title=f"{flag}  {len(found)} trouvé{'s' if len(found)>1 else ''} sur {checked} vérifiés",
+                        description=lines,
+                        color=color
+                    )
+                    embed.set_footer(text=f"meanings • scan {label} en cours...")
+                    try:
+                        await progress_msg.edit(embed=embed)
+                    except Exception:
+                        pass
+
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for code in candidates:
+            if len(found) >= max_results:
+                break
+            tasks.append(asyncio.create_task(check_one(session, code)))
+            if len(tasks) >= PARALLEL * 4:
+                await asyncio.gather(*tasks)
+                tasks = []
+                if len(found) >= max_results:
+                    break
+        if tasks and len(found) < max_results:
+            await asyncio.gather(*tasks)
+
+    return found[:max_results]
+
+async def run_vanity_scan(ctx, generator_fn, label: str, color: int, flag: str, limit: int = MAX_RESULTS):
+    limit = max(1, min(limit, 30))
+    embed = discord.Embed(
+        description=f"```\n⏳  Génération des candidats...\n```",
+        color=0x2B2D31
+    )
+    embed.set_author(name=f"Vanity {label}", icon_url="https://cdn.discordapp.com/emojis/1073636771073794048.webp")
+    embed.set_footer(text="meanings • scan vanity en cours")
+    msg = await ctx.send(embed=embed)
+
+    candidates = generator_fn()
+    embed.description = f"```\n🔎  {len(candidates)} candidats — vérification...\n```"
+    await msg.edit(embed=embed)
+
+    found = await scan_vanity(candidates, limit, msg, label, color, flag)
+
+    if not found:
+        embed = discord.Embed(
+            title=f"{flag}  Aucun vanity disponible",
+            description="> Tous les candidats sont pris.\n> Relance la commande pour un nouveau scan.",
+            color=0xFF4444
+        )
+        embed.set_footer(text=f"meanings • {len(candidates)} candidats scannés")
+    else:
+        lines = "\n".join(f"> `discord.gg/{p}`" for p in found)
+        embed = discord.Embed(
+            title=f"{flag}  {len(found)} vanity disponible{'s' if len(found)>1 else ''}",
+            description=lines,
+            color=color
+        )
+        embed.set_footer(
+            text=f"meanings • {len(candidates)} scannés — dico {len(ALL_FR):,} FR · {len(ALL_EN):,} EN"
+        )
+    await msg.edit(embed=embed)
+
+@bot.command(name="vanityfr")
+async def vanity_fr(ctx, limit: int = MAX_RESULTS):
+    await run_vanity_scan(ctx, gen_fr, "FR", 0x0055A4, "🇫🇷", limit)
+
+@bot.command(name="vanityen")
+async def vanity_en(ctx, limit: int = MAX_RESULTS):
+    await run_vanity_scan(ctx, gen_en, "EN", 0xED4245, "🇬🇧", limit)
+
+@bot.command(name="vanitymix")
+async def vanity_mix(ctx, limit: int = MAX_RESULTS):
+    await run_vanity_scan(ctx, gen_mix, "MIX", 0x9B59B6, "🌐", limit)
 
 @bot.command(name="help")
 async def help_cmd(ctx):
     embed = discord.Embed(
         title="meanings — aide",
-        description=(
-            "Trouve des pseudos Discord disponibles à partir de vrais mots.\n​"
-        ),
+        description="Trouve des pseudos et vanity URLs Discord disponibles.\nAjoute un nombre pour choisir combien de résultats tu veux.\n​",
         color=0x5865F2
     )
     embed.add_field(
-        name="🇫🇷  `+meaningfr`",
-        value="Pseudos issus du dictionnaire français",
+        name="👤  Pseudos",
+        value=(
+            "🇫🇷  `+meaningfr [n]` — dico français\n"
+            "🇬🇧  `+meaningen [n]` — dico anglais\n"
+            "🌐  `+meaningmix [n]` — mix FR × EN"
+        ),
         inline=False
     )
     embed.add_field(
-        name="🇬🇧  `+meaningen`",
-        value="Pseudos issus du dictionnaire anglais",
+        name="🔗  Vanity URLs (`discord.gg/…`)",
+        value=(
+            "🇫🇷  `+vanityfr [n]` — vanity français\n"
+            "🇬🇧  `+vanityen [n]` — vanity anglais\n"
+            "🌐  `+vanitymix [n]` — vanity mix FR × EN"
+        ),
         inline=False
     )
     embed.add_field(
-        name="🌐  `+meaningmix`",
-        value="Combos FR × EN — le plus créatif",
+        name="Exemple",
+        value="`+meaningen 5` → 5 pseudos EN\n`+vanityfr 3` → 3 vanity FR",
         inline=False
     )
     embed.set_footer(
-        text=f"meanings • dico {len(ALL_FR):,} FR · {len(ALL_EN):,} EN · max {MAX_RESULTS} résultats"
+        text=f"meanings • dico {len(ALL_FR):,} FR · {len(ALL_EN):,} EN · max 30 résultats"
     )
     await ctx.send(embed=embed)
 
