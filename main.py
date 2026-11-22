@@ -513,10 +513,29 @@ def load_cities(path):
     return list(cities)
 
 
+def load_cities_by_country(path):
+    """Retourne un dict {country_code_lower: [villes]} depuis le CSV world-cities."""
+    result = {}
+    if not os.path.exists(path): return result
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            for row in csv.DictReader(f):
+                name    = row.get("name", "").strip()
+                country = row.get("country", "").strip().lower()
+                if not name or not country: continue
+                cleaned = re.sub(r'[^a-z]', '', strip_accents(name.lower()))
+                if 3 <= len(cleaned) <= 20:
+                    result.setdefault(country, set()).add(cleaned)
+    except Exception as e:
+        print(f"[WARN] villes_by_country : {e}")
+    return {k: list(v) for k, v in result.items()}
+
+
 print("[*] Chargement des dicos...")
 _loaded_fr     = load_wordlist("words_fr.json")
 _loaded_en     = load_wordlist("words_en.txt")
 _loaded_cities = load_cities("words_cities.csv")
+_loaded_cities_by_country = load_cities_by_country("words_cities.csv")
 
 BUILTIN_FR = ["lune","soleil","etoile","ciel","nuage","brume","orage","tonnerre","eclair",
     "pluie","neige","givre","glace","vent","tempete","montagne","vallee","desert","foret",
@@ -546,6 +565,58 @@ if _loaded_cities:
     ALL_CITIES = FAMOUS_CITIES + [c for c in _loaded_cities if c not in _famous_set]
 else:
     ALL_CITIES = FAMOUS_CITIES
+
+# dict {country_name_lower: [villes]} chargé depuis le CSV
+ALL_CITIES_BY_COUNTRY = _loaded_cities_by_country  # ex: {"france": [...], "germany": [...]}
+
+# Index construit au runtime : 2 premières lettres du nom pays CSV → liste de clés
+# ex: "fr" → ["france"], "ge" → ["germany","georgia"], "un" → ["united states","united kingdom",...]
+_COUNTRY_PREFIX_INDEX: dict[str, list[str]] = {}
+
+def _build_prefix_index():
+    for country_key in ALL_CITIES_BY_COUNTRY:
+        prefix = country_key[:2]
+        _COUNTRY_PREFIX_INDEX.setdefault(prefix, []).append(country_key)
+
+_build_prefix_index()
+
+
+def _resolve_country(arg: str):
+    """
+    Résout un argument vers la clé du dict ALL_CITIES_BY_COUNTRY.
+    Priorité :
+      1) correspondance exacte sur le nom complet  (ex: "france")
+      2) 2 premières lettres du nom pays CSV        (ex: "fr" → "france")
+         — si collision (ex: "ge" → germany/georgia) : prend le plus peuplé (liste la plus longue)
+      3) correspondance partielle début de nom       (ex: "germ" → "germany")
+    Retourne (clé_trouvée, label_affiché) ou (None, None).
+    """
+    a = arg.strip().lower()
+
+    # 1) exact
+    if a in ALL_CITIES_BY_COUNTRY:
+        return a, a.title()
+
+    # 2) 2 premières lettres → index préfixe
+    if len(a) == 2 and a in _COUNTRY_PREFIX_INDEX:
+        candidates = _COUNTRY_PREFIX_INDEX[a]
+        # en cas de collision prendre le pays avec le plus de villes (pool le plus riche)
+        best = max(candidates, key=lambda k: len(ALL_CITIES_BY_COUNTRY[k]))
+        return best, best.title()
+
+    # 3) partiel sur début de nom (3+ lettres)
+    starts = [k for k in ALL_CITIES_BY_COUNTRY if k.startswith(a)]
+    if starts:
+        best = max(starts, key=lambda k: len(ALL_CITIES_BY_COUNTRY[k]))
+        return best, best.title()
+
+    # 4) partiel contenu (fallback)
+    contains = [k for k in ALL_CITIES_BY_COUNTRY if a in k]
+    if contains:
+        best = max(contains, key=lambda k: len(ALL_CITIES_BY_COUNTRY[k]))
+        return best, best.title()
+
+    return None, None
 
 LANGS = {
     "de": ["wald","stein","berg","fluss","see","mond","sonne","wind","feuer","wasser","erde",
@@ -1209,7 +1280,7 @@ async def cmd_4cfull(ctx, limit: int = MAX_RESULTS):
             f"> Toutes les `{total:,}` combos ont été parcourues.\n> Utilise `+4cfull reset` pour recommencer.",
             C["check"]))
         return
-    batch = max(limit * 10, 2000)
+    batch = _4C_SWEEP_STATE["total"] - offset  # tout le restant d'un coup
     candidates = _gen_4c_chunk(offset, batch)
     STATS["scans"] += 1
     pct = int(offset / total * 100)
@@ -1352,8 +1423,44 @@ async def cmd_vanitymix(ctx, limit: int = MAX_RESULTS):
 
 
 @bot.command(name="vanitycity")
-async def cmd_vanitycity(ctx, limit: int = MAX_RESULTS):
-    await run_vanity_scan(ctx, ALL_CITIES, "CITY", C["city"], "🌍", limit, preserve_order=True)
+async def cmd_vanitycity(ctx, *args):
+    """
+    +vanitycity [n]            — toutes les villes
+    +vanitycity <code> [n]     — villes d'un pays  ex: +vanitycity fr 10
+    +vanitycity <nom> [n]      — idem avec nom complet ex: +vanitycity germany 5
+    """
+    limit = CONFIG["max_results"]
+    country_arg = None
+
+    if args:
+        # dernier arg numérique = limit
+        if args[-1].isdigit():
+            limit = int(args[-1])
+            country_arg = " ".join(args[:-1]) if len(args) > 1 else None
+        else:
+            country_arg = " ".join(args)
+
+    limit = max(1, min(limit, 30))
+
+    if country_arg:
+        key, label = _resolve_country(country_arg)
+        if key is None:
+            await ctx.send(embed=make_embed(
+                description=f"❌ Pays introuvable : `{country_arg}`\nExemples : `fr`, `de`, `en`, `japan`, `brazil`",
+                color=C["error"], footer="vanitycity"))
+            return
+        pool = ALL_CITIES_BY_COUNTRY.get(key, [])
+        if not pool:
+            await ctx.send(embed=make_embed(
+                description=f"❌ Aucune ville trouvée pour `{label}` dans le CSV.",
+                color=C["error"], footer="vanitycity"))
+            return
+        flag_label = f"CITY · {label}"
+    else:
+        pool = ALL_CITIES
+        flag_label = "CITY"
+
+    await run_vanity_scan(ctx, pool, flag_label, C["city"], "🌍", limit, preserve_order=True)
 
 
 @bot.command(name="vanityshort")
@@ -2637,7 +2744,7 @@ HELP_CATEGORIES = {
         (f"+meaning{c} [n]", f"Pseudos {c.upper()}") for c in ("de","es","it","pt","nl","pl","sv","no","jp","ko","ar","ru")]},
     "themes": {"emoji": "🎨", "label": "Thèmes Pseudos", "cmds": [(f"+{t[0]} [n]", t[2].title()) for t in _THEME_SCANS]},
     "vanity": {"emoji": "🔗", "label": "Vanity URLs", "cmds": [
-        ("+vanityfr [n]","FR"),("+vanityen [n]","EN"),("+vanitymix [n]","Mix"),("+vanitycity [n]","Villes"),
+        ("+vanityfr [n]","FR"),("+vanityen [n]","EN"),("+vanitymix [n]","Mix"),("+vanitycity [pays] [n]","Villes (filtre pays optionnel)"),
         ("+vanityshort [n]","Courts"),("+vanityog [n]","OG"),("+luckyvanity","1 vanity dispo"),
         ("+vanitymega [n]","300 candidats"),("+vanitydeep [n]","200 candidats"),("+vanitycolor [n]","Couleurs"),
     ] + [(f"+{t[0]} [n]", f"Vanity {t[2].title()}") for t in _VANITY_THEMES]},
