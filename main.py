@@ -1124,9 +1124,9 @@ def _gen_4c_chunk(offset: int, size: int, charset=None) -> list:
     return result
 
 
-@bot.command(name="4c")
+@bot.command(name="4calnum")
 async def cmd_4c(ctx, limit: int = MAX_RESULTS):
-    """Scan aléatoire de pseudos 4 chars (a-z + 0-9). Usage: +4c [nombre]"""
+    """Scan aléatoire de pseudos 4 chars (a-z + 0-9). Usage: +4calnum [nombre]"""
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
     limit = max(1, min(limit, 30))
