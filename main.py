@@ -23,7 +23,7 @@ import ssl
 # ── AUTO-SETUP : télécharge les dicos si absents ─────────────────────────────
 _WORDLISTS = {
     "words_en.txt": "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt",
-    "words_fr.txt": "https://raw.githubusercontent.com/hbenbel/French-Dictionary/master/dictionary/dictionary.txt",
+    "words_fr.txt": "https://raw.githubusercontent.com/Thecoolsim/French-Scrabble-ODS8/main/ODS8.txt",
 }
 _ctx = ssl.create_default_context()
 for _fname, _url in _WORDLISTS.items():
@@ -294,25 +294,22 @@ def is_valid(name: str) -> bool:
     return True
 
 # ── GÉNÉRATION DE CANDIDATS ───────────────────────────────────────────────────
-SUFFIXES = ["", "x", "z", "v", "ix", "oz", "_", "xo", "00", "real", "irl", "og", "0x", "vx"]
-PREFIXES_LIST = ["its", "im", "the", "not", "un", "re", "de", "anti", "xo", "pro"]
-
 def build_pool(word_list: list[str], n: int = CANDIDATES) -> list[str]:
-    pool = set()
-    sample = random.sample(word_list, min(500, len(word_list)))
+    # Priorité 1 : vrais mots seuls (3-16 chars)
+    solo = [w for w in word_list if 3 <= len(w) <= 16 and is_valid(w)]
+    random.shuffle(solo)
 
-    for w in sample:
-        for s in SUFFIXES:
-            pool.add(f"{w}{s}")
-        for p in PREFIXES_LIST[:5]:
-            pool.add(f"{p}{w}")
-            pool.add(f"{p}_{w}")
+    pool = set(solo[:n])
 
-    pairs = random.sample(sample, min(80, len(sample)))
-    for a, b in itertools.combinations(pairs, 2):
-        if 4 <= len(a) + len(b) <= 20:
-            pool.add(f"{a}{b}")
-            pool.add(f"{a}_{b}")
+    # Priorité 2 : si pas assez, ajouter quelques combos courts mot+mot
+    if len(pool) < n:
+        pairs_src = random.sample(solo, min(120, len(solo)))
+        for a, b in itertools.combinations(pairs_src, 2):
+            if len(pool) >= n * 2:
+                break
+            if 5 <= len(a) + len(b) <= 16:
+                pool.add(f"{a}{b}")
+                pool.add(f"{a}_{b}")
 
     result = [p for p in pool if is_valid(p)]
     random.shuffle(result)
