@@ -43,11 +43,14 @@ PREFIX      = "+"
 START_TIME  = time.time()
 OWNER_ID    = int(os.environ.get("OWNER_ID", "0"))
 
-USER_HEADERS = {
-    "Authorization": USER_TOKEN,
-    "Content-Type":  "application/json",
-    "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-}
+def get_user_headers():
+    return {
+        "Authorization": USER_TOKEN,
+        "Content-Type":  "application/json",
+        "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+USER_HEADERS = get_user_headers()  # backwards compat
 
 # ── ÉTAT GLOBAL ───────────────────────────────────────────────────────────────
 STATS        = {"scans": 0, "found": 0, "checked": 0, "commands": 0}
@@ -461,7 +464,39 @@ BUILTIN_EN = ["moon","sun","star","sky","cloud","mist","storm","thunder","lightn
 
 ALL_FR     = _loaded_fr     if _loaded_fr     else BUILTIN_FR
 ALL_EN     = _loaded_en     if _loaded_en     else BUILTIN_EN
-ALL_CITIES = _loaded_cities if _loaded_cities else []
+
+BUILTIN_CITIES = [
+    "paris","london","berlin","madrid","rome","milan","barcelona","amsterdam","vienna","zurich",
+    "prague","warsaw","budapest","brussels","stockholm","oslo","copenhagen","helsinki","athens","lisbon",
+    "tokyo","osaka","kyoto","seoul","beijing","shanghai","hongkong","singapore","bangkok","jakarta",
+    "newyork","losangeles","chicago","houston","phoenix","seattle","boston","miami","dallas","denver",
+    "toronto","montreal","vancouver","sydney","melbourne","brisbane","auckland","dubai","cairo","lagos",
+    "moscow","istanbul","riyadh","karachi","mumbai","delhi","kolkata","dhaka","manila","taipei",
+    "amsterdam","rotterdam","lyon","marseille","bordeaux","toulouse","nice","nantes","strasbourg",
+    "munich","hamburg","frankfurt","cologne","dusseldorf","stuttgart","dresden","leipzig","nuremberg",
+    "valencia","seville","bilbao","zaragoza","malaga","palma","granada","alicante","murcia","valladolid",
+    "naples","turin","florence","venice","bologna","genoa","palermo","catania","bari","verona",
+    "porto","coimbra","braga","aveiro","faro","funchal","setubal","amadora","almada","sintra",
+    "zurich","geneva","basel","bern","lausanne","winterthur","lucerne","thun","chur","frauenfeld",
+    "vienna","graz","linz","salzburg","innsbruck","klagenfurt","villach","wels","steyr","dornbirn",
+    "brussels","antwerp","ghent","liege","bruges","namur","leuven","mons","aalst","mechelen",
+    "stockholm","gothenburg","malmo","uppsala","vasteras","orebro","linkoping","helsingborg","jonkoping","norrkoping",
+    "oslo","bergen","trondheim","stavanger","drammen","fredrikstad","kristiansand","sandnes","tromsoe","sarpsborg",
+    "copenhagen","aarhus","odense","aalborg","esbjerg","horsens","randers","kolding","vejle","herning",
+    "helsinki","espoo","tampere","vantaa","oulu","turku","jyvaskyla","lahti","kuopio","pori",
+    "athens","thessaloniki","patras","heraklion","larissa","volos","rhodes","ioannina","chania","chalcis",
+    "dubai","abudhabi","sharjah","ajman","ras","fujairah","umm","khor","kalba","dibba",
+    "toronto","montreal","vancouver","calgary","edmonton","ottawa","winnipeg","quebec","hamilton","kitchener",
+    "sydney","melbourne","brisbane","perth","adelaide","goldie","newcastle","canberra","hobart","darwin",
+    "auckland","wellington","christchurch","hamilton","tauranga","napier","palmerston","dunedin","rotorua","whangarei",
+    "cairo","alexandria","giza","shubra","luxor","aswan","port","suez","faiyum","zagazig",
+    "lagos","kano","ibadan","abuja","port","benin","maiduguri","zaria","aba","jos",
+    "nairobi","mombasa","kisumu","nakuru","eldoret","thika","malindi","kitale","garissa","kakamega",
+    "accra","kumasi","tamale","takoradi","cape","koforidua","sunyani","ho","wa","bolgatanga",
+    "dakar","thies","kaolack","saint","ziguinchor","diourbel","louga","tambacounda","kolda","matam",
+    "casablanca","rabat","fes","marrakech","agadir","tangier","meknes","kenitra","tetouan","sale"
+]
+ALL_CITIES = _loaded_cities if _loaded_cities else BUILTIN_CITIES
 
 # Dicos multilingues intégrés
 LANGS = {
@@ -580,14 +615,18 @@ def build_pool(word_list, n=100, min_len=3, max_len=16,
 
 # ── CHECK PSEUDO ──────────────────────────────────────────────────────────────
 async def check_available(session, username):
+    if not USER_TOKEN:
+        return None  # pas de USER_TOKEN configuré
     url = "https://discord.com/api/v9/users/@me/pomelo-attempt"
     try:
         async with session.post(url, json={"username": username},
-                headers=USER_HEADERS, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                headers=get_user_headers(), timeout=aiohttp.ClientTimeout(total=5)) as r:
             STATS["checked"] += 1
             if r.status == 200:
                 data = await r.json(content_type=None)
                 return not data.get("taken", True)
+            elif r.status == 401:
+                return "INVALID_TOKEN"
             elif r.status == 429:
                 retry = float(r.headers.get("Retry-After", 3))
                 await asyncio.sleep(retry)
@@ -676,6 +715,21 @@ async def _scan_engine(candidates, max_results, msg, flag, label, color,
 async def run_scan(ctx, word_list, label, color, flag,
                    limit=MAX_RESULTS, min_len=3, max_len=16,
                    aesthetic=False, leet=False, underscore=False, speed=None):
+    if not USER_TOKEN:
+        e = discord.Embed(
+            title="❌  USER_TOKEN manquant",
+            description=(
+                "> Le scan de pseudos nécessite un **USER_TOKEN** Discord.\n"
+                "> Configure la variable `USER_TOKEN` sur Railway.\n\n"
+                "> **Comment l'obtenir :**\n"
+                "> 1. Ouvre Discord dans le navigateur\n"
+                "> 2. F12 → Network → cherche une requête\n"
+                "> 3. Copie le header `Authorization`\n"
+                "> 4. Colle dans Railway → Variables → `USER_TOKEN`"
+            ),
+            color=C["error"]
+        )
+        await ctx.send(embed=e); return
     if speed is None: speed = CONFIG["check_delay"]
     limit = max(1, min(limit, 30))
     n = min(max(limit*6, 30), 200)
@@ -683,6 +737,11 @@ async def run_scan(ctx, word_list, label, color, flag,
     msg = await ctx.send(embed=make_embed(description=f"```\n⏳  Génération — {label}...\n```", footer="scan en cours"))
     candidates = build_pool(word_list, n, min_len, max_len, aesthetic, leet, False, underscore)
     found, checked = await _scan_engine(candidates, limit, msg, flag, label, color, check_available, False, ctx, speed)
+    if not found and checked == 0:
+        await msg.edit(embed=discord.Embed(
+            title="❌  Token invalide ou expiré",
+            description="> Le `USER_TOKEN` ne fonctionne pas.\n> Récupère-en un nouveau sur Discord Web.",
+            color=C["error"])); return
     await msg.edit(embed=result_embed(found, checked, flag, label, color))
 
 async def run_vanity_scan(ctx, word_list, label, color, flag,
@@ -2401,122 +2460,217 @@ HELP_CATEGORIES = {
     },
 }
 
-TOTAL_CMDS = sum(len(v["cmds"]) for v in HELP_CATEGORIES.values()) + 30  # +30 dynamiques
+TOTAL_CMDS = sum(len(v["cmds"]) for v in HELP_CATEGORIES.values()) + 60  # +30 dynamiques len/c/l + 30 nouvelles
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELP SYSTEM — style Gestion (Views discord.py 2.x)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_help_home_embed():
+    """Embed page d'accueil +help style Gestion"""
+    e = discord.Embed(
+        title="Help - meanings",
+        description=(
+            "**Bienvenue dans le système d'aide de meanings !**\n\n"
+            "Sélectionnez une catégorie ci-dessous pour\n"
+            "découvrir toutes les commandes disponibles.\n"
+            f"Commandes disponibles : `{TOTAL_CMDS}` · Préfixe : `+`\n​"
+        ),
+        color=C["info"]
+    )
+    lines = []
+    for key, cat in HELP_CATEGORIES.items():
+        n = str(len(cat["cmds"])).zfill(2)
+        lines.append(f"`{n}`  **{cat['label']}**")
+    e.add_field(name="​", value="\n".join(lines), inline=False)
+    e.add_field(
+        name="​",
+        value=(
+            "`+help <catégorie>` · `+helpall` · `+helpall <catégorie>`\n"
+            "**Catégories :** "
+            + "  ".join(f"`{k}`" for k in HELP_CATEGORIES)
+        ),
+        inline=False
+    )
+    e.add_field(
+        name="🚀  Quickstart",
+        value=(
+            "`+meaningen 5` — 5 pseudos EN\n"
+            "`+og 3` — 3 OG 4-6 chars\n"
+            "`+4c 5` — 5 pseudos de 4 chars exactement\n"
+            "`+check storm` — vérifier un pseudo\n"
+            "`+checkall storm` — pseudo + vanity\n"
+            "`+dark 5` — thème dark\n"
+            "`+lucky` — 1 pseudo rapide"
+        ),
+        inline=False
+    )
+    e.set_footer(text=f"meanings v4.0 · {len(ALL_FR):,} FR · {len(ALL_EN):,} EN · {len(ALL_CITIES):,} villes · {len(THEMES)} thèmes")
+    return e
+
+
+def _build_cat_embed(key: str):
+    """Embed catégorie pour +help <cat>"""
+    cat = HELP_CATEGORIES[key]
+    cmds = cat["cmds"]
+    # Chips style Gestion : toutes les commandes en ligne séparées par virgules
+    chip_line = ", ".join(f"`{c[0]}`" for c in cmds)
+    e = discord.Embed(
+        title=f"{cat['emoji']}  {cat['label']} ({len(cmds)})",
+        description=chip_line + "\n​",
+        color=C["info"]
+    )
+    e.set_footer(text=f"meanings · +helpall {key} pour tout voir")
+    return e
+
+
+def _build_helpall_pages():
+    """Génère les pages pour +helpall global — style Gestion (toutes catégories, chips)"""
+    pages = []
+    # Page 1 : aperçu global
+    e1 = discord.Embed(
+        title=f"✦  Commandes · {TOTAL_CMDS}",
+        color=C["info"]
+    )
+    for key, cat in HELP_CATEGORIES.items():
+        cmds = cat["cmds"]
+        chip_line = ", ".join(f"`{c[0]}`" for c in cmds[:8])
+        if len(cmds) > 8: chip_line += f", ..."
+        e1.add_field(
+            name=f"{cat['emoji']}  {cat['label']} ({len(cmds)})",
+            value=chip_line + f"\n`+helpall {key}` pour tout voir",
+            inline=False
+        )
+    e1.set_footer(text="meanings v4.0 · préfixe + · page 1")
+    pages.append(e1)
+
+    # Pages suivantes : détail de chaque catégorie (groupées 3 par page)
+    cat_items = list(HELP_CATEGORIES.items())
+    per_page  = 3
+    for i in range(0, len(cat_items), per_page):
+        e = discord.Embed(title=f"✦  Commandes · {TOTAL_CMDS}", color=C["info"])
+        for key, cat in cat_items[i:i+per_page]:
+            cmds = cat["cmds"]
+            chip_line = ", ".join(f"`{c[0]}`" for c in cmds)
+            e.add_field(
+                name=f"{cat['emoji']}  {cat['label']} ({len(cmds)})",
+                value=chip_line,
+                inline=False
+            )
+        pg = i//per_page + 2
+        total_pg = math.ceil(len(cat_items)/per_page) + 1
+        e.set_footer(text=f"meanings v4.0 · préfixe + · page {pg}/{total_pg}")
+        pages.append(e)
+    return pages
+
+
+def _build_helpall_cat_pages(key: str):
+    """Pages pour +helpall <cat> — toutes les commandes avec descriptions"""
+    cat  = HELP_CATEGORIES[key]
+    cmds = cat["cmds"]
+    per  = 12  # commandes par page
+    pages = []
+    total_pg = math.ceil(len(cmds)/per)
+    for i in range(0, len(cmds), per):
+        chunk = cmds[i:i+per]
+        chip_line = ", ".join(f"`{c[0]}`" for c in chunk)
+        e = discord.Embed(
+            title=f"{cat['emoji']}  {cat['label']} ({len(cmds)})",
+            description=chip_line,
+            color=C["info"]
+        )
+        pg = i//per + 1
+        e.set_footer(text=f"meanings · {key} · page {pg}/{total_pg}")
+        pages.append(e)
+    return pages
+
+
+class HelpView(discord.ui.View):
+    """View avec boutons Précédent / Suivant + Accueil"""
+    def __init__(self, pages, page=0, home_embed=None):
+        super().__init__(timeout=120)
+        self.pages     = pages
+        self.page      = page
+        self.home_embed = home_embed
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.children[0].disabled = (self.page == 0)                   # Précédent
+        self.children[1].disabled = (self.page >= len(self.pages)-1)   # Suivant
+
+    @discord.ui.button(label="Précédent", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page-1)
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.page], view=self)
+
+    @discord.ui.button(label="Suivant", style=discord.ButtonStyle.primary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(len(self.pages)-1, self.page+1)
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.page], view=self)
+
+    @discord.ui.button(label="Accueil", style=discord.ButtonStyle.secondary, emoji="🏠")
+    async def home_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.home_embed:
+            # Reset nav view sans le bouton Accueil (on est à l'accueil)
+            view = HomeView()
+            await interaction.response.edit_message(embed=self.home_embed, view=view)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
+class HomeView(discord.ui.View):
+    """View page d'accueil +help — bouton Accueil désactivé"""
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="Accueil", style=discord.ButtonStyle.secondary, emoji="🏠", disabled=True)
+    async def home_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
 
 @bot.command(name="help")
 async def cmd_help(ctx, section: str = None):
     STATS["commands"] += 1
 
-    # Si une section nommée
     if section and section.lower() in HELP_CATEGORIES:
-        cat = HELP_CATEGORIES[section.lower()]
-        e = discord.Embed(
-            title=f"{cat['emoji']}  {cat['label']}",
-            description=f"**{len(cat['cmds'])} commandes**\nAjoute `[n]` pour choisir le nombre de résultats (max 30)\n​",
-            color=C["info"]
-        )
-        # Groupe les commandes par page de 8
-        cmds = cat["cmds"]
-        for i in range(0, min(len(cmds), 16), 2):
-            chunk = cmds[i:i+2]
-            for cmd, desc in chunk:
-                e.add_field(name=f"`{cmd}`", value=f"> {desc}", inline=False)
-        if len(cmds) > 16:
-            e.add_field(name="📌  Suite", value=f"> Utilisez `+helpall {section}` pour voir toutes les commandes.", inline=False)
-        e.set_footer(text=f"meanings v4.0 · +helpall pour tout voir · +help pour le menu")
-        await ctx.send(embed=e)
+        # Page catégorie avec pagination
+        pages = _build_helpall_cat_pages(section.lower())
+        home  = _build_help_home_embed()
+        view  = HelpView(pages, 0, home_embed=home)
+        await ctx.send(embed=pages[0], view=view)
         return
 
-    # Menu principal style "Gestion"
-    total = TOTAL_CMDS
-    desc_lines = [
-        "**Bienvenue dans le système d'aide de meanings !**\n",
-        "Sélectionnez une catégorie ci-dessous pour découvrir toutes les commandes disponibles.",
-        f"Commandes disponibles : `{total}` · Préfixe : `+`\n​"
-    ]
-    e = discord.Embed(
-        title="✦  Help — meanings",
-        description="\n".join(desc_lines),
-        color=C["info"]
-    )
-
-    cat_lines = []
-    for key, cat in HELP_CATEGORIES.items():
-        n = str(len(cat["cmds"])).zfill(2)
-        cat_lines.append(f"`{n}`  **{cat['label']}**")
-
-    # Affiche en 2 colonnes
-    half = math.ceil(len(cat_lines)/2)
-    left  = "\n".join(cat_lines[:half])
-    right = "\n".join(cat_lines[half:])
-    e.add_field(name="​", value=left,  inline=True)
-    e.add_field(name="​", value=right, inline=True)
-
-    e.add_field(name="​", value=(
-        "`+help <catégorie>` · `+helpall` · `+helpall <catégorie>`\n"
-        "**Catégories :** `scan` `longueur` `multilingue` `themes` `vanity` `check` `outils` `watch` `favoris` `stats` `bot` `admin`"
-    ), inline=False)
-
-    e.add_field(name="🚀  Quickstart", value=(
-        "`+meaningen 5` — 5 pseudos EN\n"
-        "`+og 3` — 3 OG 4-6 chars\n"
-        "`+4c 5` — 5 pseudos de 4 chars exactement\n"
-        "`+check storm` — vérifier un pseudo\n"
-        "`+checkall storm` — pseudo + vanity\n"
-        "`+dark 5` — thème dark\n"
-        "`+lucky` — 1 pseudo rapide"
-    ), inline=False)
-
-    e.set_footer(text=f"meanings v4.0 · {len(ALL_FR):,} FR · {len(ALL_EN):,} EN · {len(ALL_CITIES):,} villes · {len(THEMES)} thèmes")
-    await ctx.send(embed=e)
+    # Page d'accueil
+    e    = _build_help_home_embed()
+    view = HomeView()
+    await ctx.send(embed=e, view=view)
 
 
 @bot.command(name="helpall")
 async def cmd_helpall(ctx, section: str = None, page: int = 1):
     STATS["commands"] += 1
 
-    # helpall d'une catégorie spécifique avec pagination
     if section and section.lower() in HELP_CATEGORIES:
-        cat = HELP_CATEGORIES[section.lower()]
-        cmds = cat["cmds"]
-        per_page = 10
-        total_pages = math.ceil(len(cmds) / per_page)
-        page = max(1, min(page, total_pages))
-        start = (page-1)*per_page
-        chunk = cmds[start:start+per_page]
-
-        e = discord.Embed(
-            title=f"{cat['emoji']}  {cat['label']} ({len(cmds)} commandes)",
-            description=f"​",
-            color=C["info"]
-        )
-        for cmd, desc in chunk:
-            e.add_field(name=f"`{cmd}`", value=f"> {desc}", inline=False)
-        e.set_footer(text=f"meanings · page {page}/{total_pages} · +helpall {section} {page+1} pour la suite")
-        await ctx.send(embed=e)
+        pages   = _build_helpall_cat_pages(section.lower())
+        home    = _build_help_home_embed()
+        pg      = max(0, min(page-1, len(pages)-1))
+        view    = HelpView(pages, pg, home_embed=home)
+        await ctx.send(embed=pages[pg], view=view)
         return
 
-    # helpall global — liste toutes les catégories avec leurs commandes (1 embed par catégorie)
-    # On envoie le menu des catégories + indique comment naviguer
-    e = discord.Embed(
-        title=f"✦  Commandes · {TOTAL_CMDS}",
-        description=(
-            "Toutes les commandes du bot **meanings**.\n"
-            "Utilise `+helpall <catégorie>` pour voir le détail.\n​"
-        ),
-        color=C["info"]
-    )
-    for key, cat in HELP_CATEGORIES.items():
-        n = len(cat["cmds"])
-        # Première commande de chaque catégorie comme exemple
-        examples = ", ".join(f"`{c[0].split(' ')[0]}`" for c in cat["cmds"][:5])
-        e.add_field(
-            name=f"{cat['emoji']}  {cat['label']} ({n})",
-            value=f"{examples}...\n> `+helpall {key}` pour tout voir",
-            inline=False
-        )
-    e.set_footer(text=f"meanings v4.0 · préfixe + · {TOTAL_CMDS} commandes au total")
-    await ctx.send(embed=e)
+    # helpall global paginé
+    pages = _build_helpall_pages()
+    home  = _build_help_home_embed()
+    view  = HelpView(pages, 0, home_embed=home)
+    await ctx.send(embed=pages[0], view=view)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  🆕 200 NOUVELLES COMMANDES
