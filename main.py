@@ -1086,6 +1086,175 @@ for _name, _size, _flag, _label, _color, _speed in [
     bot.command(name=_name)(_sized_cmd(_size, _flag, _label, _color, _speed))
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  🔢 SCANS 4 CHARS — lettres + chiffres (a-z, 0-9) → 36^4 = 1 679 616 combos
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CHARS_ALPHA  = list("abcdefghijklmnopqrstuvwxyz")
+_CHARS_DIGIT  = list("0123456789")
+_CHARS_ALNUM  = _CHARS_ALPHA + _CHARS_DIGIT  # 36 chars → 36^4 = 1 679 616
+
+def _gen_4c_random(n: int, charset=None) -> list:
+    """Génère n combinaisons 4-chars aléatoires sans répétition (charset=alnum par défaut)."""
+    cs = charset or _CHARS_ALNUM
+    seen = set()
+    result = []
+    max_tries = n * 20
+    for _ in range(max_tries):
+        if len(result) >= n:
+            break
+        combo = "".join(random.choices(cs, k=4))
+        if combo not in seen:
+            seen.add(combo)
+            result.append(combo)
+    return result
+
+
+def _gen_4c_chunk(offset: int, size: int, charset=None) -> list:
+    """Retourne un slice déterministe de toutes les combos 4-chars (pour sweep exhaustif)."""
+    cs = charset or _CHARS_ALNUM
+    base = len(cs)
+    result = []
+    for i in range(offset, min(offset + size, base ** 4)):
+        tmp, combo = i, []
+        for _ in range(4):
+            combo.append(cs[tmp % base])
+            tmp //= base
+        result.append("".join(reversed(combo)))
+    return result
+
+
+@bot.command(name="4c")
+async def cmd_4c(ctx, limit: int = MAX_RESULTS):
+    """Scan aléatoire de pseudos 4 chars (a-z + 0-9). Usage: +4c [nombre]"""
+    if not USER_TOKEN:
+        await ctx.send(embed=token_missing_embed()); return
+    limit = max(1, min(limit, 30))
+    STATS["scans"] += 1
+    n_candidates = max(limit * 10, 200)
+    candidates = _gen_4c_random(n_candidates)
+    msg = await ctx.send(embed=make_embed(
+        description=f"```\n🔢  4C RANDOM — {n_candidates} candidats...\n```",
+        footer="4c scan"))
+    found, checked = await _scan_engine(
+        candidates, limit, msg, "🔢", "4C RANDOM", C["og"], check_available, False, ctx)
+    if not found and checked == 0:
+        remaining = max(0, int(RATE["until"] - time.time()))
+        desc = (f"> Rate limit — réessaie dans ~`{remaining}s`." if remaining > 0
+                else "> Token invalide ou expiré.")
+        await msg.edit(embed=discord.Embed(title="❌  Token refusé ou limite Discord",
+                                           description=desc, color=C["error"]))
+        return
+    await msg.edit(embed=result_embed(found, checked, "🔢", "4C RANDOM", C["og"]))
+
+
+@bot.command(name="4cletters")
+async def cmd_4cletters(ctx, limit: int = MAX_RESULTS):
+    """Scan aléatoire 4 chars lettres seulement (a-z). Usage: +4cletters [nombre]"""
+    if not USER_TOKEN:
+        await ctx.send(embed=token_missing_embed()); return
+    limit = max(1, min(limit, 30))
+    STATS["scans"] += 1
+    candidates = _gen_4c_random(max(limit * 10, 200), _CHARS_ALPHA)
+    msg = await ctx.send(embed=make_embed(
+        description="```\n🔡  4C LETTERS — scan...\n```", footer="4cletters"))
+    found, checked = await _scan_engine(
+        candidates, limit, msg, "🔡", "4C LETTERS", C["og"], check_available, False, ctx)
+    if not found and checked == 0:
+        remaining = max(0, int(RATE["until"] - time.time()))
+        desc = (f"> Rate limit — réessaie dans ~`{remaining}s`." if remaining > 0
+                else "> Token invalide ou expiré.")
+        await msg.edit(embed=discord.Embed(title="❌  Token refusé ou limite Discord",
+                                           description=desc, color=C["error"]))
+        return
+    await msg.edit(embed=result_embed(found, checked, "🔡", "4C LETTERS", C["og"]))
+
+
+@bot.command(name="4cdigits")
+async def cmd_4cdigits(ctx, limit: int = MAX_RESULTS):
+    """Scan aléatoire 4 chars chiffres seulement (0-9). Usage: +4cdigits [nombre]"""
+    if not USER_TOKEN:
+        await ctx.send(embed=token_missing_embed()); return
+    limit = max(1, min(limit, 30))
+    STATS["scans"] += 1
+    candidates = _gen_4c_random(max(limit * 10, 200), _CHARS_DIGIT)
+    msg = await ctx.send(embed=make_embed(
+        description="```\n🔢  4C DIGITS — scan...\n```", footer="4cdigits"))
+    found, checked = await _scan_engine(
+        candidates, limit, msg, "🔢", "4C DIGITS", C["og"], check_available, False, ctx)
+    if not found and checked == 0:
+        remaining = max(0, int(RATE["until"] - time.time()))
+        desc = (f"> Rate limit — réessaie dans ~`{remaining}s`." if remaining > 0
+                else "> Token invalide ou expiré.")
+        await msg.edit(embed=discord.Embed(title="❌  Token refusé ou limite Discord",
+                                           description=desc, color=C["error"]))
+        return
+    await msg.edit(embed=result_embed(found, checked, "🔢", "4C DIGITS", C["og"]))
+
+
+# State pour le sweep exhaustif (persist en mémoire pendant la session)
+_4C_SWEEP_STATE = {"offset": 0, "total": len(_CHARS_ALNUM) ** 4}  # 1 679 616
+
+@bot.command(name="4cfull")
+async def cmd_4cfull(ctx, limit: int = MAX_RESULTS):
+    """Sweep exhaustif 4C — parcourt toutes les 1 679 616 combos en ordre. Reprend où il s'est arrêté.
+    Usage: +4cfull [nombre]  |  +4cfull reset pour repartir de zéro"""
+    if not USER_TOKEN:
+        await ctx.send(embed=token_missing_embed()); return
+    limit = max(1, min(limit, 30))
+    offset = _4C_SWEEP_STATE["offset"]
+    total  = _4C_SWEEP_STATE["total"]
+    if offset >= total:
+        await ctx.send(embed=make_embed("✅  Sweep terminé",
+            f"> Toutes les `{total:,}` combos ont été parcourues.\n> Utilise `+4cfull reset` pour recommencer.",
+            C["check"]))
+        return
+    batch = max(limit * 10, 200)
+    candidates = _gen_4c_chunk(offset, batch)
+    STATS["scans"] += 1
+    pct = int(offset / total * 100)
+    msg = await ctx.send(embed=make_embed(
+        description=f"```\n🗺️  4C FULL — offset {offset:,}/{total:,} ({pct}%)...\n```",
+        footer="4cfull sweep"))
+    found, checked = await _scan_engine(
+        candidates, limit, msg, "🗺️", "4C FULL", C["og"], check_available, False, ctx)
+    _4C_SWEEP_STATE["offset"] = offset + batch
+    if not found and checked == 0:
+        remaining = max(0, int(RATE["until"] - time.time()))
+        desc = (f"> Rate limit — réessaie dans ~`{remaining}s`." if remaining > 0
+                else "> Token invalide ou expiré.")
+        await msg.edit(embed=discord.Embed(title="❌  Token refusé ou limite Discord",
+                                           description=desc, color=C["error"]))
+        return
+    new_offset = _4C_SWEEP_STATE["offset"]
+    new_pct    = min(100, int(new_offset / total * 100))
+    e = result_embed(found, checked, "🗺️", "4C FULL", C["og"])
+    e.set_footer(text=f"meanings · sweep {new_offset:,}/{total:,} ({new_pct}%) — +4cfull pour continuer")
+    await msg.edit(embed=e)
+
+
+@bot.command(name="4creset")
+async def cmd_4creset(ctx):
+    """Remet le pointeur du sweep +4cfull à zéro."""
+    _4C_SWEEP_STATE["offset"] = 0
+    await ctx.send(embed=make_embed("✅  4C reset",
+        f"> Sweep remis à zéro. `+4cfull` reprend depuis `aaaa`.", C["check"]))
+
+
+@bot.command(name="4cstatus")
+async def cmd_4cstatus(ctx):
+    """Affiche la progression du sweep exhaustif 4C."""
+    offset = _4C_SWEEP_STATE["offset"]
+    total  = _4C_SWEEP_STATE["total"]
+    pct    = min(100, int(offset / total * 100))
+    remaining_combos = max(0, total - offset)
+    e = discord.Embed(title="🗺️  4C Sweep — Statut", color=C["og"])
+    e.add_field(name="Progression", value=f"`{offset:,}` / `{total:,}` ({pct}%)", inline=False)
+    e.add_field(name="Restant", value=f"`{remaining_combos:,}` combos", inline=True)
+    e.add_field(name="Prochain chunk", value=f"offset `{offset:,}`", inline=True)
+    await ctx.send(embed=e)
+
+
 @bot.command(name="lucky")
 async def cmd_lucky(ctx):
     if not USER_TOKEN:
