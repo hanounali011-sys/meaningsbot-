@@ -651,7 +651,10 @@ async def check_vanity(session, code):
     return None
 
 # ── EMBED HELPER ──────────────────────────────────────────────────────────────
-def make_embed(title="", desc="", color=C["dark"], footer="meanings"):
+def make_embed(title="", desc="", color=C["dark"], footer="meanings", description=None):
+    # accept both desc= and description= kwargs
+    if description is not None:
+        desc = description
     e = discord.Embed(title=title, description=desc, color=color)
     e.set_footer(text=f"meanings · {footer}")
     return e
@@ -671,6 +674,24 @@ def result_embed(found, scanned, flag, label, color, is_vanity=False):
 # ── SCAN ENGINE ───────────────────────────────────────────────────────────────
 async def _scan_engine(candidates, max_results, msg, flag, label, color,
                         check_fn, is_vanity=False, ctx=None, speed=CHECK_DELAY):
+    # Vérification token pour scans pseudo (pas vanity)
+    if not is_vanity and check_fn == check_available and not USER_TOKEN:
+        e = discord.Embed(
+            title="❌  USER_TOKEN manquant",
+            description=(
+                "> Le scan de pseudos nécessite un **USER_TOKEN** Discord.\n\n"
+                "> **Comment l'obtenir :**\n"
+                "> 1. Ouvre **discord.com** dans Chrome (pas l'appli)\n"
+                "> 2. F12 → onglet **Network**\n"
+                "> 3. Fais n'importe quelle action sur Discord\n"
+                "> 4. Cherche une requête `api/v9` → Headers → `Authorization`\n"
+                "> 5. Copie la valeur → Railway → Variables → `USER_TOKEN`"
+            ),
+            color=0xe74c3c
+        )
+        try: await msg.edit(embed=e)
+        except: pass
+        return [], 0
     found = []
     checked = 0
     sem = asyncio.Semaphore(CONFIG["parallel"])
@@ -968,6 +989,8 @@ async def cmd_underscore(ctx, limit: int = MAX_RESULTS):
 @bot.command(name="lucky")
 async def cmd_lucky(ctx):
     STATS["commands"] += 1
+    if not USER_TOKEN:
+        await ctx.send(embed=discord.Embed(title="❌  USER_TOKEN manquant", description="> Configure `USER_TOKEN` sur Railway.", color=0xe74c3c)); return
     candidates = build_pool(ALL_FR+ALL_EN, 30, 3, 10)
     msg = await ctx.send(embed=make_embed(description="```\n🍀  Lucky search...\n```", footer="lucky"))
     async with aiohttp.ClientSession() as session:
