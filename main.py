@@ -38,7 +38,7 @@ for _fname, _url in _WORDLISTS.items():
 BOT_TOKEN   = os.environ.get("BOT_TOKEN",  "").strip()
 USER_TOKEN  = os.environ.get("USER_TOKEN", "").strip()
 CHECK_DELAY = 0.3
-MAX_RESULTS = 15
+MAX_RESULTS = 50
 PARALLEL    = 5
 PREFIX      = "+"
 START_TIME  = time.time()
@@ -513,19 +513,62 @@ def load_cities(path):
     return list(cities)
 
 
-def load_cities_by_country(path):
-    """Retourne un dict {country_code_lower: [villes]} depuis le CSV world-cities."""
+def _city_is_known(name_raw: str, cleaned: str, max_len: int) -> bool:
+    """
+    Retourne True si la ville passe les filtres "ville connue" :
+      1. nom nettoyé <= max_len caractères
+      2. segments dans le nom original :
+           - 1 segment  → toujours OK si longueur ok  (Paris, Amiens, Lyon...)
+           - 2 segments → OK seulement si nettoyé <= 10  (Saint-Malo, New York...)
+           - 3+ segments → toujours rejeté  (Saint-Foy-lès-Lyon, Fontenay-sous-Bois...)
+    """
+    if len(cleaned) > max_len:
+        return False
+    segments = re.split(r'[\s\-\.]+', name_raw.strip())
+    n = len(segments)
+    if n >= 3:
+        return False
+    if n == 2 and len(cleaned) > 10:
+        return False
+    return True
+
+
+def load_cities_by_country(path, min_pop: int = 0, max_len: int = 11):
+    """
+    Retourne un dict {country_name_lower: [villes]} depuis le CSV world-cities.
+    Filtres appliqués :
+      - population >= min_pop  si la colonne existe dans le CSV
+      - nom original <= 2 segments (pas de Saint-Foy-lès-Lyon)
+      - longueur nom nettoyé <= max_len
+    """
     result = {}
     if not os.path.exists(path): return result
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
-            for row in csv.DictReader(f):
+            reader = csv.DictReader(f)
+            has_pop = None
+            for row in reader:
                 name    = row.get("name", "").strip()
                 country = row.get("country", "").strip().lower()
                 if not name or not country: continue
+
+                if has_pop is None:
+                    has_pop = "population" in row
+
+                if has_pop:
+                    try:
+                        pop = int(row.get("population", 0) or 0)
+                    except ValueError:
+                        pop = 0
+                    if pop < min_pop:
+                        continue
+
                 cleaned = re.sub(r'[^a-z]', '', strip_accents(name.lower()))
-                if 3 <= len(cleaned) <= 20:
-                    result.setdefault(country, set()).add(cleaned)
+                if len(cleaned) < 3:
+                    continue
+                if not _city_is_known(name, cleaned, max_len):
+                    continue
+                result.setdefault(country, set()).add(cleaned)
     except Exception as e:
         print(f"[WARN] villes_by_country : {e}")
     return {k: list(v) for k, v in result.items()}
@@ -545,8 +588,90 @@ BUILTIN_EN = ["moon","sun","star","sky","cloud","mist","storm","thunder","lightn
     "snow","frost","ice","wind","gale","mountain","valley","desert","forest","ocean","sea",
     "lake","river","waterfall","wave","island","cliff","cave","rock","flame","flower","rose"]
 
-ALL_FR = _loaded_fr if _loaded_fr else BUILTIN_FR
-ALL_EN = _loaded_en if _loaded_en else BUILTIN_EN
+def _sort_pseudo_quality(words: list) -> list:
+    """
+    Trie les mots par score "qualité pseudo" décroissant.
+    Rien n'est supprimé — les conjugaisons rares et mots longs arrivent en queue.
+
+    Score (plus bas = meilleur, trié croissant) :
+      +0  longueur 3–6   (OG, court)
+      +1  longueur 7–9   (moyen)
+      +2  longueur 10+   (long)
+      +0  pas de suffixe de conjugaison rare
+      +2  suffixe rare (aient, erais, assiez, ions, iez…)
+      +0  prononçable (≤3 consonnes de suite)
+      +1  4 consonnes de suite
+      +2  5+ consonnes de suite
+    """
+    RARE_SUFFIXES = (
+        "assiez", "assions", "eraient", "eriez", "erions",
+        "erait", "erais", "aient", "iez",
+        "asses", "asse",
+    )
+    VOWELS = set("aeiouy")
+
+    def _cons_run(w):
+        best = cur = 0
+        for c in w:
+            if c not in VOWELS: cur += 1; best = max(best, cur)
+            else: cur = 0
+        return best
+
+    def _score(w):
+        s = 0
+        n = len(w)
+        if n <= 6:   s += 0
+        elif n <= 9: s += 1
+        else:        s += 2
+        if any(w.endswith(sf) for sf in RARE_SUFFIXES): s += 2
+        cr = _cons_run(w)
+        if cr >= 5:   s += 2
+        elif cr >= 4: s += 1
+        return s
+
+    return sorted(words, key=_score)
+
+
+FR_CONJ = (
+    "eraient", "assions", "assiez", "erions", "eriez", "eront", "erons", "erez", "eras",
+    "erais", "erait", "erai", "aient", "ions", "iez", "ais", "ait", "ant", "ons", "ez",
+    "ees", "ee", "ues", "ies", "es", "ent", "era", "rai", "ras", "ront",
+)
+
+
+def _sort_fr_conjugated_first(words: list) -> list:
+    """
+    FR : met EN PREMIER les mots "genre dico long" : conjugaisons / pluriels / mots de 7-14 lettres
+    (ex: expliqueras, detruirons, embeterai, reconnaissait, courageuses...).
+    Les petits mots courants (probablement déjà pris) passent en queue. Rien n'est supprimé.
+    Score (plus bas = d'abord) :
+      0 : conjugaison/pluriel ET longueur 7-14
+      1 : conjugaison/pluriel OU longueur 7-14
+      2 : le reste (mots courts courants)
+    À score égal, les mots les plus longs d'abord.
+    """
+    CONJ = FR_CONJ
+
+    def _score(w):
+        n = len(w)
+        conj = w.endswith(CONJ)
+        good_len = 7 <= n <= 14
+        if conj and good_len: return (0, -n)
+        if conj or good_len:  return (1, -n)
+        return (2, -n)
+
+    return sorted(words, key=_score)
+
+
+ALL_FR = _sort_fr_conjugated_first(_loaded_fr if _loaded_fr else BUILTIN_FR)
+
+# Sous-liste "genre dico long" (mots de 7-14 lettres) : c'est elle que les
+# commandes FR piochent, pour que le MAXIMUM de résultats soient de ce genre.
+# (build_pool mélange la liste -> le simple tri ne suffisait pas ; on filtre donc la source.)
+ALL_FR_GENRE = [w for w in ALL_FR if 7 <= len(w) <= 14]   # mots de 7-14 lettres (conjugués, pluriels, noms longs...)
+if len(ALL_FR_GENRE) < 200:          # sécurité : dico trop petit/absent -> liste complète
+    ALL_FR_GENRE = ALL_FR
+ALL_EN = _sort_pseudo_quality(_loaded_en if _loaded_en else BUILTIN_EN)
 
 FAMOUS_CITIES = [
     "paris","london","berlin","tokyo","rome","madrid","barcelona","amsterdam","vienna","prague",
@@ -927,8 +1052,8 @@ async def run_scan(ctx, word_list, label, color, flag,
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
     if speed is None: speed = CONFIG["check_delay"]
-    limit = max(1, min(limit, 30))
-    n = min(max(limit * 6, 30), 200)
+    limit = max(1, min(limit, 50))
+    n = min(max(limit * 20, 100), 800)
     STATS["scans"] += 1
     msg = await ctx.send(embed=make_embed(description=f"```\n⏳  Génération — {label}...\n```", footer="scan en cours"))
     try:
@@ -953,8 +1078,8 @@ async def run_vanity_scan(ctx, word_list, label, color, flag,
                           limit=MAX_RESULTS, min_len=3, max_len=16, speed=None,
                           preserve_order=False):
     if speed is None: speed = CONFIG["check_delay"]
-    limit = max(1, min(limit, 30))
-    n = min(max(limit * 6, 30), 200)
+    limit = max(1, min(limit, 50))
+    n = min(max(limit * 20, 100), 800)
     STATS["scans"] += 1
     msg = await ctx.send(embed=make_embed(description=f"```\n⏳  Vanity — {label}...\n```", footer="scan en cours"))
     try:
@@ -1011,8 +1136,8 @@ def _len_cmd(exact):
                  9:C["fr"],10:C["fr"],11:C["en"],12:C["en"]}.get(exact, C["info"])
         rarity = {3:"🔴 Extrêmement rares",4:"🟠 Très rares",5:"🟡 Rares",
                   6:"🟢 Peu communs",7:"🔵 Communs"}.get(exact, "⚪ Fréquents")
-        limit_real = max(1, min(limit, 30))
-        n = min(max(limit_real * 6, 30), 200)
+        limit_real = max(1, min(limit, 50))
+        n = min(max(limit_real * 20, 100), 800)
         STATS["scans"] += 1
         msg = await ctx.send(embed=make_embed(
             description=f"```\n🔢  Scan {exact} chars exactement...\n{rarity}\n```",
@@ -1059,16 +1184,16 @@ for _n in range(3, 13):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _fr_mix():
-    return random.sample(ALL_FR, min(300, len(ALL_FR))) + random.sample(ALL_EN, min(300, len(ALL_EN)))
+    return random.sample(ALL_FR_GENRE, min(300, len(ALL_FR_GENRE))) + random.sample(ALL_EN, min(300, len(ALL_EN)))
 
 
 _DICT_SCANS = [
-    ("meaningfr",  lambda: ALL_FR, "FR", "fr", "🇫🇷", {}),
-    ("meaningfr2", lambda: random.sample(ALL_FR, min(500, len(ALL_FR))), "FR²", "fr", "🇫🇷", {}),
+    ("meaningfr",  lambda: ALL_FR_GENRE, "FR", "fr", "🇫🇷", {}),
+    ("meaningfr2", lambda: random.sample(ALL_FR_GENRE, min(500, len(ALL_FR_GENRE))), "FR²", "fr", "🇫🇷", {}),
     ("frshort",    lambda: ALL_FR, "FR SHORT", "short", "⚡🇫🇷", {"min_len": 3, "max_len": 5}),
-    ("frlong",     lambda: ALL_FR, "FR LONG", "fr", "📏🇫🇷", {"min_len": 8, "max_len": 16}),
-    ("fraesthetic",lambda: ALL_FR, "FR AESTHETIC", "aesthetic", "✨🇫🇷", {"aesthetic": True}),
-    ("frleet",     lambda: ALL_FR, "FR L33T", "cyber", "💻🇫🇷", {"leet": True}),
+    ("frlong",     lambda: ALL_FR_GENRE, "FR LONG", "fr", "📏🇫🇷", {"min_len": 8, "max_len": 16}),
+    ("fraesthetic",lambda: ALL_FR_GENRE, "FR AESTHETIC", "aesthetic", "✨🇫🇷", {"aesthetic": True}),
+    ("frleet",     lambda: ALL_FR_GENRE, "FR L33T", "cyber", "💻🇫🇷", {"leet": True}),
     ("meaningen",  lambda: ALL_EN, "EN", "en", "🇬🇧", {}),
     ("meaningen2", lambda: random.sample(ALL_EN, min(500, len(ALL_EN))), "EN²", "en", "🇬🇧", {}),
     ("enshort",    lambda: ALL_EN, "EN SHORT", "short", "⚡🇬🇧", {"min_len": 3, "max_len": 5}),
@@ -1138,7 +1263,7 @@ def _sized_cmd(size, flag, label, color, speed=None):
     async def _inner(ctx, limit: int = MAX_RESULTS):
         if not USER_TOKEN:
             await ctx.send(embed=token_missing_embed()); return
-        limit = max(1, min(limit, 30))
+        limit = max(1, min(limit, 50))
         STATS["scans"] += 1
         msg = await ctx.send(embed=make_embed(description=f"```\n{flag}  {label} — {size} candidats...\n```", footer=label.lower()))
         candidates = await build_pool_async(ALL_FR + ALL_EN, size, 3, 16)
@@ -1200,7 +1325,7 @@ async def cmd_4c(ctx, limit: int = MAX_RESULTS):
     """Scan aléatoire de pseudos 4 chars (a-z + 0-9). Usage: +4calnum [nombre]"""
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
-    limit = max(1, min(limit, 30))
+    limit = max(1, min(limit, 50))
     STATS["scans"] += 1
     n_candidates = max(limit * 10, 200)
     candidates = _gen_4c_random(n_candidates)
@@ -1224,7 +1349,7 @@ async def cmd_4cletters(ctx, limit: int = MAX_RESULTS):
     """Scan aléatoire 4 chars lettres seulement (a-z). Usage: +4cletters [nombre]"""
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
-    limit = max(1, min(limit, 30))
+    limit = max(1, min(limit, 50))
     STATS["scans"] += 1
     candidates = _gen_4c_random(max(limit * 10, 200), _CHARS_ALPHA)
     msg = await ctx.send(embed=make_embed(
@@ -1246,7 +1371,7 @@ async def cmd_4cdigits(ctx, limit: int = MAX_RESULTS):
     """Scan aléatoire 4 chars chiffres seulement (0-9). Usage: +4cdigits [nombre]"""
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
-    limit = max(1, min(limit, 30))
+    limit = max(1, min(limit, 50))
     STATS["scans"] += 1
     candidates = _gen_4c_random(max(limit * 10, 200), _CHARS_DIGIT)
     msg = await ctx.send(embed=make_embed(
@@ -1272,7 +1397,7 @@ async def cmd_4cfull(ctx, limit: int = MAX_RESULTS):
     Usage: +4cfull [nombre]  |  +4cfull reset pour repartir de zéro"""
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
-    limit = max(1, min(limit, 30))
+    limit = max(1, min(limit, 50))
     offset = _4C_SWEEP_STATE["offset"]
     total  = _4C_SWEEP_STATE["total"]
     if offset >= total:
@@ -1440,7 +1565,7 @@ async def cmd_vanitycity(ctx, *args):
         else:
             country_arg = " ".join(args)
 
-    limit = max(1, min(limit, 30))
+    limit = max(1, min(limit, 50))
 
     if country_arg:
         key, label = _resolve_country(country_arg)
@@ -1486,7 +1611,7 @@ async def cmd_vanitycolors(ctx, limit: int = MAX_RESULTS):
 
 def _vanity_sized(size, flag, label, color):
     async def _inner(ctx, limit: int = MAX_RESULTS):
-        limit = max(1, min(limit, 30))
+        limit = max(1, min(limit, 50))
         STATS["scans"] += 1
         msg = await ctx.send(embed=make_embed(description=f"```\n{flag}  Vanity {label}...\n```", footer=f"vanity{label.lower()}"))
         raw = await build_pool_async(ALL_FR + ALL_EN, size, 3, 16)
@@ -1553,7 +1678,7 @@ async def _pool_scan(ctx, pool, limit, flag, label, color, intro, footer, n=80):
     STATS["scans"] += 1
     random.shuffle(pool)
     msg = await ctx.send(embed=make_embed(description=f"```\n{flag}  {intro}...\n```", footer=footer))
-    found, checked = await _scan_engine(pool[:n], max(1, min(limit, 30)), msg, flag, label, C[color], check_available, False, ctx)
+    found, checked = await _scan_engine(pool[:n], max(1, min(limit, 50)), msg, flag, label, C[color], check_available, False, ctx)
     await msg.edit(embed=result_embed(found, checked, flag, label, C[color]))
 
 
