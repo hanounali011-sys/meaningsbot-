@@ -1209,7 +1209,7 @@ async def cmd_4cfull(ctx, limit: int = MAX_RESULTS):
             f"> Toutes les `{total:,}` combos ont été parcourues.\n> Utilise `+4cfull reset` pour recommencer.",
             C["check"]))
         return
-    batch = max(limit * 10, 200)
+    batch = max(limit * 10, 2000)
     candidates = _gen_4c_chunk(offset, batch)
     STATS["scans"] += 1
     pct = int(offset / total * 100)
