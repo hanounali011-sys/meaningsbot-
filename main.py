@@ -40,8 +40,8 @@ BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
 USER_TOKEN  = os.environ.get("USER_TOKEN", "").strip()
 CHECK_DELAY = 0.5    # secondes entre chaque check
 MAX_RESULTS = 15     # pseudos dispos max par commande
-CANDIDATES  = 300    # candidats générés par scan
-PARALLEL    = 3      # checks simultanés
+CANDIDATES  = 150    # candidats générés par scan
+PARALLEL    = 8      # checks simultanés
 PREFIX      = "+"
 
 USER_HEADERS = {
