@@ -496,7 +496,26 @@ BUILTIN_CITIES = [
     "dakar","thies","kaolack","saint","ziguinchor","diourbel","louga","tambacounda","kolda","matam",
     "casablanca","rabat","fes","marrakech","agadir","tangier","meknes","kenitra","tetouan","sale"
 ]
-ALL_CITIES = _loaded_cities if _loaded_cities else BUILTIN_CITIES
+# Villes célèbres en priorité absolue
+FAMOUS_CITIES = [
+    "paris","london","berlin","tokyo","rome","madrid","barcelona","amsterdam","vienna","prague",
+    "budapest","stockholm","oslo","copenhagen","zurich","geneva","moscow","istanbul","dubai","cairo",
+    "sydney","melbourne","toronto","montreal","miami","boston","chicago","seattle","denver","phoenix",
+    "singapore","bangkok","seoul","osaka","kyoto","taipei","hongkong","shanghai","beijing","delhi",
+    "mumbai","lyon","marseille","bordeaux","toulouse","nice","nantes","strasbourg","milan","florence",
+    "venice","naples","lisbon","porto","athens","brussels","antwerp","hamburg","munich","frankfurt",
+    "cologne","warsaw","bucharest","sofia","zagreb","helsinki","riga","vilnius","tallinn","reykjavik",
+    "dublin","edinburgh","glasgow","manchester","birmingham","liverpool","leeds","bristol","cardiff","belfast",
+    "montreal","vancouver","calgary","ottawa","quebec","lagos","nairobi","accra","dakar","casablanca",
+    "marrakech","tunis","algiers","johannesburg","capetown","pretoria","lagos","abuja","addisababa","kampala"
+]
+_famous_set = set(FAMOUS_CITIES)
+if _loaded_cities:
+    # Villes célèbres d'abord, puis le reste du CSV
+    _rest = [c for c in _loaded_cities if c not in _famous_set]
+    ALL_CITIES = FAMOUS_CITIES + _rest
+else:
+    ALL_CITIES = BUILTIN_CITIES
 
 # Dicos multilingues intégrés
 LANGS = {
@@ -579,9 +598,11 @@ def to_underscore(word):
 
 # ── BUILD POOL ────────────────────────────────────────────────────────────────
 def build_pool(word_list, n=100, min_len=3, max_len=16,
-               aesthetic=False, leet=False, reverse=False, underscore=False):
+               aesthetic=False, leet=False, reverse=False, underscore=False,
+               preserve_order=False):
     solo = [w for w in word_list if min_len <= len(w) <= max_len and is_valid(w)]
-    random.shuffle(solo)
+    if not preserve_order:
+        random.shuffle(solo)
     pool = set(solo[:n])
 
     if aesthetic:
@@ -601,16 +622,21 @@ def build_pool(word_list, n=100, min_len=3, max_len=16,
             v = to_underscore(w)
             if is_valid(v): pool.add(v)
 
-    if len(pool) < n:
+    # Mots seuls d'abord — combos seulement si vraiment pas assez
+    solo_valid = [p for p in pool if is_valid(p) and '_' not in p and p in set(solo)]
+    combos = []
+    if len(solo_valid) < n:
         pairs_src = random.sample(solo, min(120, len(solo)))
         for a,b in itertools.combinations(pairs_src,2):
-            if len(pool) >= n*2: break
+            if len(combos) >= n*2: break
             if 5 <= len(a)+len(b) <= max_len:
-                pool.add(f"{a}{b}")
-                pool.add(f"{a}_{b}")
+                combos.append(f"{a}{b}")
+                combos.append(f"{a}_{b}")
+        random.shuffle(combos)
 
-    result = [p for p in pool if is_valid(p)]
-    random.shuffle(result)
+    # Priorité : mots seuls d'abord, combos pour compléter
+    extras = [p for p in pool if is_valid(p) and p not in set(solo_valid)]
+    result = solo_valid + extras + [c for c in combos if is_valid(c)]
     return result[:n]
 
 # ── CHECK PSEUDO ──────────────────────────────────────────────────────────────
@@ -766,13 +792,14 @@ async def run_scan(ctx, word_list, label, color, flag,
     await msg.edit(embed=result_embed(found, checked, flag, label, color))
 
 async def run_vanity_scan(ctx, word_list, label, color, flag,
-                           limit=MAX_RESULTS, min_len=3, max_len=16, speed=None):
+                           limit=MAX_RESULTS, min_len=3, max_len=16, speed=None,
+                           preserve_order=False):
     if speed is None: speed = CONFIG["check_delay"]
     limit = max(1, min(limit, 30))
     n = min(max(limit*6, 30), 200)
     STATS["scans"] += 1; STATS["commands"] += 1
     msg = await ctx.send(embed=make_embed(description=f"```\n⏳  Vanity — {label}...\n```", footer="scan en cours"))
-    raw = build_pool(word_list, n*2, min_len, max_len)
+    raw = build_pool(word_list, n*2, min_len, max_len, preserve_order=preserve_order)
     candidates = [c for c in raw if is_vanity_allowed(c)][:n]
     found, checked = await _scan_engine(candidates, limit, msg, flag, label, color, check_vanity, True, ctx, speed)
     await msg.edit(embed=result_embed(found, checked, flag, label, color, is_vanity=True))
@@ -1208,7 +1235,7 @@ async def cmd_vanitymix(ctx, limit: int = MAX_RESULTS):
 async def cmd_vanitycity(ctx, limit: int = MAX_RESULTS):
     if not ALL_CITIES:
         await ctx.send(embed=make_embed("❌  Dico villes manquant","",C["error"])); return
-    await run_vanity_scan(ctx, ALL_CITIES, "CITY", C["city"], "🌍", limit)
+    await run_vanity_scan(ctx, ALL_CITIES, "CITY", C["city"], "🌍", limit, preserve_order=True)
 
 @bot.command(name="vanityshort")
 async def cmd_vanityshort(ctx, limit: int = MAX_RESULTS):
