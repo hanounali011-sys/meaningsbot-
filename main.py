@@ -64,6 +64,7 @@ FAV_TAGS     = defaultdict(dict)
 WATCH_PAUSED = set()
 CONFIG       = {"max_results": MAX_RESULTS, "check_delay": CHECK_DELAY, "parallel": PARALLEL}
 TOTAL_CMDS   = 0
+RATE         = {"until": 0.0}   # fin du blocage 429 sur la route pseudo
 
 # ── COULEURS ──────────────────────────────────────────────────────────────────
 C = {
@@ -704,8 +705,13 @@ async def check_available(session, username):
                 return "INVALID_TOKEN"
             elif r.status == 429:
                 retry = float(r.headers.get("Retry-After", 3))
-                await asyncio.sleep(retry)
-                return None
+                try:
+                    import json as _j
+                    retry = float(_j.loads(body).get("retry_after", retry))
+                except Exception:
+                    pass
+                RATE["until"] = time.time() + retry
+                return "RATE_LIMITED"
     except Exception as ex:
         print(f"[DEBUG] pomelo exception: {ex}", flush=True)
     return None
@@ -771,23 +777,34 @@ async def _scan_engine(candidates, max_results, msg, flag, label, color,
         try: await msg.edit(embed=token_missing_embed())
         except Exception: pass
         return [], 0
+    wait = RATE["until"] - time.time()
+    if not is_vanity and check_fn == check_available and wait > 0:
+        try:
+            await msg.edit(embed=make_embed("⏳  Limite Discord",
+                f"> Checks de pseudos bloqués encore ~`{int(wait)}s`.\n> Les commandes `vanity` ne sont pas touchées.", C["warn"]))
+        except Exception: pass
+        return [], 0
 
     found = []
     checked = 0
     invalid = False
+    limited = False
     sem = asyncio.Semaphore(CONFIG["parallel"])
 
     async def check_one(session, target):
-        nonlocal checked, invalid
-        if invalid or len(found) >= max_results:
+        nonlocal checked, invalid, limited
+        if invalid or limited or len(found) >= max_results:
             return
         async with sem:
-            if invalid or len(found) >= max_results:
+            if invalid or limited or len(found) >= max_results:
                 return
             await asyncio.sleep(speed)
             result = await check_fn(session, target)
             if result == "INVALID_TOKEN":
                 invalid = True
+                return
+            if result == "RATE_LIMITED":
+                limited = True
                 return
             checked += 1
             if result is True:
@@ -810,7 +827,7 @@ async def _scan_engine(candidates, max_results, msg, flag, label, color,
     async with aiohttp.ClientSession() as session:
         tasks = []
         for target in candidates:
-            if invalid or len(found) >= max_results: break
+            if invalid or limited or len(found) >= max_results: break
             tasks.append(asyncio.create_task(check_one(session, target)))
             if len(tasks) >= CONFIG["parallel"] * 4:
                 await asyncio.gather(*tasks); tasks = []
@@ -838,8 +855,8 @@ async def run_scan(ctx, word_list, label, color, flag,
     found, checked = await _scan_engine(candidates, limit, msg, flag, label, color, check_available, False, ctx, speed)
     if not found and checked == 0:
         await msg.edit(embed=discord.Embed(
-            title="❌  Token invalide ou aucune réponse",
-            description="> Le `USER_TOKEN` est refusé ou Discord ne répond pas.\n> Regarde les logs `[DEBUG] pomelo`.",
+            title="❌  Token refusé ou limite Discord",
+            description="> Token refusé, ou limite Discord atteinte.\n> Réessaie dans quelques minutes (voir les logs `[DEBUG] pomelo`).",
             color=C["error"])); return
     await msg.edit(embed=result_embed(found, checked, flag, label, color))
 
@@ -1061,7 +1078,7 @@ async def cmd_lucky(ctx):
     async with aiohttp.ClientSession() as session:
         for t in candidates:
             r = await check_available(session, t)
-            if r == "INVALID_TOKEN": break
+            if r in ("INVALID_TOKEN", "RATE_LIMITED"): break
             if r is True:
                 await msg.edit(embed=discord.Embed(title="🍀  Lucky !", description=f"> `{t}` est libre !", color=C["lucky"]))
                 return
@@ -1370,6 +1387,8 @@ async def cmd_check(ctx, *, mot: str = None):
         e = discord.Embed(title="✅  Disponible", description=f"> `{mot}` est libre !", color=C["check"])
     elif result is False:
         e = discord.Embed(title="❌  Pris", description=f"> `{mot}` est utilisé.", color=C["error"])
+    elif result == "RATE_LIMITED":
+        e = make_embed("⏳  Limite Discord", f"> Réessaie dans ~`{int(max(0, RATE['until'] - time.time()))}s`.", C["warn"])
     else:
         e = make_embed("⚠️  Erreur", "> Réessaie.", C["warn"])
     e.set_footer(text=f"meanings · check · {mot}")
