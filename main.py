@@ -22,7 +22,7 @@ from collections import defaultdict
 # ── AUTO-SETUP ────────────────────────────────────────────────────────────────
 _WORDLISTS = {
     "words_en.txt":     "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt",
-    "words_fr.txt":     "https://raw.githubusercontent.com/Thecoolsim/French-Scrabble-ODS8/main/ODS8.txt",
+    "words_fr.json":    "https://raw.githubusercontent.com/words/an-array-of-french-words/master/index.json",
     "words_cities.csv": "https://raw.githubusercontent.com/datasets/world-cities/master/data/world-cities.csv",
 }
 for _fname, _url in _WORDLISTS.items():
@@ -481,8 +481,17 @@ def load_wordlist(path):
     if not os.path.exists(path): return []
     words = set()
     with open(path, encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            w = strip_accents(line.strip().lower())
+        if path.endswith(".json"):
+            import json
+            try:
+                lines = json.load(f)
+            except Exception as ex:
+                print(f"[WARN] {path} illisible : {ex}")
+                return []
+        else:
+            lines = f
+        for line in lines:
+            w = strip_accents(str(line).strip().lower())
             if re.match(r'^[a-z]{3,20}$', w):
                 words.add(w)
     return list(words)
@@ -505,7 +514,7 @@ def load_cities(path):
 
 
 print("[*] Chargement des dicos...")
-_loaded_fr     = load_wordlist("words_fr.txt")
+_loaded_fr     = load_wordlist("words_fr.json")
 _loaded_en     = load_wordlist("words_en.txt")
 _loaded_cities = load_cities("words_cities.csv")
 
@@ -575,6 +584,8 @@ LANGS = {
 }
 
 print(f"[*] Prêt — FR:{len(ALL_FR):,} EN:{len(ALL_EN):,} Villes:{len(ALL_CITIES):,}")
+if not _loaded_fr:
+    print("[WARN] Dico FR non chargé : seuls 41 mots de secours sont utilisés.")
 
 # ── VANITY BLACKLIST ──────────────────────────────────────────────────────────
 VANITY_BLACKLIST = set([
@@ -710,7 +721,9 @@ async def check_available(session, username):
                     retry = float(_j.loads(body).get("retry_after", retry))
                 except Exception:
                     pass
+                retry = min(retry, 60)  # cap à 60s max pour éviter les blocages trop longs
                 RATE["until"] = time.time() + retry
+                print(f"[DEBUG] pomelo RATE_LIMITED — cooldown {retry:.1f}s", flush=True)
                 return "RATE_LIMITED"
     except Exception as ex:
         print(f"[DEBUG] pomelo exception: {ex}", flush=True)
@@ -854,9 +867,13 @@ async def run_scan(ctx, word_list, label, color, flag,
         await msg.edit(embed=make_embed("❌  Erreur", f"> `{ex}`", C["error"])); return
     found, checked = await _scan_engine(candidates, limit, msg, flag, label, color, check_available, False, ctx, speed)
     if not found and checked == 0:
+        remaining = max(0, int(RATE["until"] - time.time()))
+        desc = (f"> Rate limit Discord active — réessaie dans ~`{remaining}s`.\n> (logs `[DEBUG] pomelo` pour détails)"
+                if remaining > 0 else
+                "> Token invalide ou expiré — vérifie `USER_TOKEN`.\n> Ou rate limit dépassée, réessaie dans quelques secondes.")
         await msg.edit(embed=discord.Embed(
             title="❌  Token refusé ou limite Discord",
-            description="> Token refusé, ou limite Discord atteinte.\n> Réessaie dans quelques minutes (voir les logs `[DEBUG] pomelo`).",
+            description=desc,
             color=C["error"])); return
     await msg.edit(embed=result_embed(found, checked, flag, label, color))
 
@@ -2206,6 +2223,18 @@ async def cmd_ping(ctx):
     lat = round(bot.latency * 1000)
     color = C["check"] if lat < 100 else C["warn"] if lat < 300 else C["error"]
     await ctx.send(embed=discord.Embed(title="🏓  Pong !", description=f"> Latence : `{lat}ms`", color=color))
+
+
+@bot.command(name="resetrate")
+async def cmd_resetrate(ctx):
+    """Reset manuel du cooldown 429 sur la route pomelo."""
+    old = max(0, int(RATE["until"] - time.time()))
+    RATE["until"] = 0.0
+    if old > 0:
+        desc = f"> Cooldown de `{old}s` annulé. Tu peux relancer tes scans."
+    else:
+        desc = "> Aucun cooldown actif — déjà libre."
+    await ctx.send(embed=make_embed("✅  Rate reset", desc, C["check"]))
 
 
 @bot.command(name="uptime")
