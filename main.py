@@ -36,8 +36,8 @@ for _fname, _url in _WORDLISTS.items():
             print(f"[WARN] Impossible de télécharger {_fname} : {_e} — fallback intégré")
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-BOT_TOKEN   = "YOUR_BOT_TOKEN_HERE"
-USER_TOKEN  = "YOUR_USER_TOKEN_HERE"
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
+USER_TOKEN  = os.environ.get("USER_TOKEN", "").strip()
 CHECK_DELAY = 0.5    # secondes entre chaque check
 MAX_RESULTS = 15     # pseudos dispos max par commande
 CANDIDATES  = 300    # candidats générés par scan
@@ -348,7 +348,54 @@ async def check_available(session: aiohttp.ClientSession, username: str) -> bool
         print(f"[ERROR] {e}")
         return None
 
-async def scan_candidates(candidates: list[str], max_results: int, progress_msg) -> list[str]:
+# ── BOT ───────────────────────────────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+@bot.event
+async def on_ready():
+    print(f"[*] Bot connecté : {bot.user}")
+    print(f"[*] Dico actif — FR: {len(ALL_FR):,} | EN: {len(ALL_EN):,}")
+
+async def run_scan(ctx, generator_fn, label: str, color: int, flag: str):
+    # ── Embed de départ
+    embed = discord.Embed(
+        description=f"```\n⏳  Génération des candidats...\n```",
+        color=0x2B2D31
+    )
+    embed.set_author(name=f"Scan {label}", icon_url="https://cdn.discordapp.com/emojis/1073636771073794048.webp")
+    embed.set_footer(text="meanings • scan en cours")
+    msg = await ctx.send(embed=embed)
+
+    candidates = generator_fn()
+
+    embed.description = f"```\n🔎  {len(candidates)} candidats — vérification...\n```"
+    await msg.edit(embed=embed)
+
+    found = await scan_candidates(candidates, MAX_RESULTS, msg, label, color, flag)
+
+    if not found:
+        embed = discord.Embed(
+            title=f"{flag}  Aucun pseudo disponible",
+            description="> Tous les candidats sont pris.\n> Relance la commande pour un nouveau scan.",
+            color=0xFF4444
+        )
+        embed.set_footer(text=f"meanings • {len(candidates)} candidats scannés")
+    else:
+        lines = "\n".join(f"> `{p}`" for p in found)
+        embed = discord.Embed(
+            title=f"{flag}  {len(found)} pseudo{'s' if len(found)>1 else ''} disponible{'s' if len(found)>1 else ''}",
+            description=lines,
+            color=color
+        )
+        embed.set_footer(
+            text=f"meanings • {len(candidates)} scannés — dico {len(ALL_FR):,} FR · {len(ALL_EN):,} EN"
+        )
+    await msg.edit(embed=embed)
+
+
+async def scan_candidates(candidates: list[str], max_results: int, progress_msg, label: str, color: int, flag: str) -> list[str]:
     found = []
     checked = 0
     sem = asyncio.Semaphore(PARALLEL)
@@ -360,15 +407,14 @@ async def scan_candidates(candidates: list[str], max_results: int, progress_msg)
             checked += 1
             if result is True:
                 found.append(username)
-                if len(found) % 3 == 0:
+                if len(found) % 3 == 0 or len(found) == 1:
+                    lines = "\n".join(f"> `{p}`" for p in found)
                     embed = discord.Embed(
-                        title="🔍 Scan en cours...",
-                        description=(
-                            f"Vérifiés : **{checked}** | Trouvés : **{len(found)}/{max_results}**\n\n"
-                            + "\n".join(f"`{p}`" for p in found)
-                        ),
-                        color=0x5865F2
+                        title=f"{flag}  {len(found)} trouvé{'s' if len(found)>1 else ''} sur {checked} vérifiés",
+                        description=lines,
+                        color=color
                     )
+                    embed.set_footer(text=f"meanings • scan {label} en cours...")
                     try:
                         await progress_msg.edit(embed=embed)
                     except Exception:
@@ -391,72 +437,45 @@ async def scan_candidates(candidates: list[str], max_results: int, progress_msg)
 
     return found[:max_results]
 
-# ── BOT ───────────────────────────────────────────────────────────────────────
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
-
-@bot.event
-async def on_ready():
-    print(f"[*] Bot connecté : {bot.user}")
-    print(f"[*] Dico actif — FR: {len(ALL_FR):,} | EN: {len(ALL_EN):,}")
-
-async def run_scan(ctx, generator_fn, label: str, color: int):
-    embed = discord.Embed(
-        title=f"🔍 Génération {label}...",
-        description="Scan en cours, patienter...",
-        color=color
-    )
-    msg = await ctx.send(embed=embed)
-    candidates = generator_fn()
-    embed.title = f"🔍 Scan {label} — {len(candidates)} candidats"
-    await msg.edit(embed=embed)
-    found = await scan_candidates(candidates, MAX_RESULTS, msg)
-    if not found:
-        embed = discord.Embed(
-            title=f"❌ Aucun pseudo dispo ({label})",
-            description="Tous pris ou erreur API. Réessaie.",
-            color=0xFF4444
-        )
-    else:
-        chunks = [found[i:i+10] for i in range(0, len(found), 10)]
-        lines = "\n".join("  ".join(f"`{p}`" for p in chunk) for chunk in chunks)
-        embed = discord.Embed(
-            title=f"✅ Pseudos dispos {label} ({len(found)})",
-            description=lines,
-            color=color
-        )
-        embed.set_footer(
-            text=f"{len(candidates)} candidats scannés | "
-                 f"Dico : {len(ALL_FR):,} FR + {len(ALL_EN):,} EN"
-        )
-    await msg.edit(embed=embed)
 
 @bot.command(name="meaningfr")
 async def meaning_fr(ctx):
-    await run_scan(ctx, gen_fr, "🇫🇷 FR", 0x0055A4)
+    await run_scan(ctx, gen_fr, "FR", 0x0055A4, "🇫🇷")
 
 @bot.command(name="meaningen")
 async def meaning_en(ctx):
-    await run_scan(ctx, gen_en, "🇬🇧 EN", 0xC8102E)
+    await run_scan(ctx, gen_en, "EN", 0xED4245, "🇬🇧")
 
 @bot.command(name="meaningmix")
 async def meaning_mix(ctx):
-    await run_scan(ctx, gen_mix, "🌐 MIX", 0x9B59B6)
+    await run_scan(ctx, gen_mix, "MIX", 0x9B59B6, "🌐")
 
 @bot.command(name="help")
 async def help_cmd(ctx):
     embed = discord.Embed(
-        title="📖 Commandes",
+        title="meanings — aide",
         description=(
-            "`+meaningfr` — pseudos FR dispos\n"
-            "`+meaningen` — pseudos EN dispos\n"
-            "`+meaningmix` — combos FR×EN dispos\n"
+            "Trouve des pseudos Discord disponibles à partir de vrais mots.\n​"
         ),
         color=0x5865F2
     )
+    embed.add_field(
+        name="🇫🇷  `+meaningfr`",
+        value="Pseudos issus du dictionnaire français",
+        inline=False
+    )
+    embed.add_field(
+        name="🇬🇧  `+meaningen`",
+        value="Pseudos issus du dictionnaire anglais",
+        inline=False
+    )
+    embed.add_field(
+        name="🌐  `+meaningmix`",
+        value="Combos FR × EN — le plus créatif",
+        inline=False
+    )
     embed.set_footer(
-        text=f"Dico : {len(ALL_FR):,} FR + {len(ALL_EN):,} EN | Max {MAX_RESULTS} résultats"
+        text=f"meanings • dico {len(ALL_FR):,} FR · {len(ALL_EN):,} EN · max {MAX_RESULTS} résultats"
     )
     await ctx.send(embed=embed)
 
