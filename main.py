@@ -2993,6 +2993,245 @@ async def cmd_helpall(ctx, section: str = None, page: int = 1):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  ⚡ AUTOSWEEP — Sweep continu +allfull sans relance manuelle
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_AUTO_STATE = {
+    "running":   False,
+    "task":      None,
+    "channel":   None,
+    "chunk":     500,       # combos testées par itération interne
+    "interval":  0.3,       # secondes entre chaque check (respecte rate limit)
+    "report_every": 5,      # rapport Discord tous les N chunks
+    "found_total": 0,
+    "iter_count":  0,
+    "start_ts":    0.0,
+}
+
+
+async def _autosweep_loop(channel, chunk_size: int):
+    """Boucle principale — tourne jusqu'à _AUTO_STATE['running'] == False."""
+    state     = _AUTO_STATE
+    all_state = _ALL_STATE           # partagé avec +allfull
+    total     = all_state["total"]
+    found_session = []
+    report_buf    = []
+
+    while state["running"]:
+        offset = all_state["offset"]
+
+        # Sweep terminé
+        if offset >= total:
+            e = discord.Embed(
+                title="✅  AutoSweep — Terminé !",
+                description=(f"> Toutes les `{total:,}` combos ont été parcourues.\n"
+                             f"> Pseudos trouvés cette session : `{state['found_total']}`\n"
+                             f"> Utilise `+allreset` puis `+autosweep start` pour recommencer."),
+                color=C["check"])
+            try: await channel.send(embed=e)
+            except Exception: pass
+            state["running"] = False
+            break
+
+        # Rate limit global en cours → attente
+        wait = RATE["until"] - time.time()
+        if wait > 0:
+            try:
+                await channel.send(embed=make_embed(
+                    "⏳  AutoSweep — Rate limit",
+                    f"> Pause ~`{int(wait)}s` imposée par Discord.",
+                    C["warn"]))
+            except Exception: pass
+            await asyncio.sleep(max(wait, 1))
+            continue
+
+        # Localise la tranche
+        length, local, base = _all_locate(offset)
+        if length is None:
+            all_state["offset"] = total
+            continue
+
+        size = min(chunk_size, len(_CHARS_FULL) ** length - local)
+        candidates, idxs = _gen_valid_chunk(local, size, length, _CHARS_FULL)
+        if not candidates:
+            all_state["offset"] = offset + size
+            continue
+
+        # Scan de la tranche
+        found_chunk = []
+        checked     = 0
+        limited     = False
+        sem = asyncio.Semaphore(CONFIG["parallel"])
+
+        async def _check(session, target):
+            nonlocal checked, limited
+            if limited: return
+            async with sem:
+                if limited: return
+                await asyncio.sleep(state["interval"])
+                result = await check_available(session, target)
+                if result == "RATE_LIMITED":
+                    limited = True
+                    return
+                if result == "INVALID_TOKEN":
+                    limited = True
+                    return
+                checked += 1
+                if result is True:
+                    found_chunk.append(target)
+                    STATS["found"] += 1
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [asyncio.create_task(_check(session, t)) for t in candidates]
+            await asyncio.gather(*tasks)
+
+        # Avance le pointeur
+        if checked:
+            all_state["offset"] = base + idxs[min(checked, len(idxs)) - 1] + 1
+        elif limited:
+            # Bloqué → attente avant retry
+            await asyncio.sleep(5)
+            continue
+
+        # Accumule résultats
+        found_session.extend(found_chunk)
+        report_buf.extend(found_chunk)
+        state["found_total"] += len(found_chunk)
+        state["iter_count"]  += 1
+
+        # Rapport périodique
+        if state["iter_count"] % state["report_every"] == 0 or found_chunk:
+            new_off = all_state["offset"]
+            pct     = new_off / total * 100
+            elapsed = time.time() - state["start_ts"]
+            speed   = new_off / elapsed if elapsed > 0 else 0
+
+            eta_s   = int((total - new_off) / speed) if speed > 0 else 0
+            eta_str = (f"{eta_s // 3600}h {(eta_s % 3600) // 60}m"
+                       if eta_s < 86400 * 30 else "∞")
+
+            lines = "\n".join(f"> `{p}`" for p in report_buf[-10:]) if report_buf else "> aucun nouveau"
+            e = discord.Embed(
+                title=f"🗺️  AutoSweep — {pct:.4f}%",
+                description=lines,
+                color=C["og"] if report_buf else C["dark"])
+            e.add_field(name="Progression",
+                        value=f"`{new_off:,}` / `{total:,}`", inline=True)
+            e.add_field(name="Trouvés (session)",
+                        value=f"`{state['found_total']}`", inline=True)
+            e.add_field(name="Vitesse",
+                        value=f"`{int(speed):,}` combos/s", inline=True)
+            e.add_field(name="ETA",
+                        value=f"`{eta_str}`", inline=True)
+            e.set_footer(text="meanings · autosweep · +autosweep stop pour arrêter")
+            try: await channel.send(embed=e)
+            except Exception: pass
+            report_buf.clear()
+
+        # Petite respiration entre chunks
+        await asyncio.sleep(0.1)
+
+    state["running"] = False
+
+
+@bot.command(name="autosweep")
+async def cmd_autosweep(ctx, action: str = "status", chunk: int = 500):
+    """
+    Sweep continu automatique sur toutes les combos 2-6 chars.
+    Usage:
+      +autosweep start [chunk=500]  — démarre (chunk = combos/itération)
+      +autosweep stop               — arrête
+      +autosweep status             — progression live
+    """
+    action = action.lower()
+
+    # ── START ──────────────────────────────────────────────────────────────────
+    if action == "start":
+        if not USER_TOKEN:
+            await ctx.send(embed=token_missing_embed()); return
+        if _AUTO_STATE["running"]:
+            await ctx.send(embed=make_embed(
+                "⚠️  Déjà en cours",
+                "> AutoSweep tourne déjà. `+autosweep stop` pour l'arrêter.",
+                C["warn"])); return
+
+        chunk = max(50, min(chunk, 2000))
+        _AUTO_STATE.update({
+            "running":     True,
+            "channel":     ctx.channel,
+            "chunk":       chunk,
+            "found_total": 0,
+            "iter_count":  0,
+            "start_ts":    time.time(),
+        })
+        _AUTO_STATE["task"] = asyncio.create_task(_autosweep_loop(ctx.channel, chunk))
+
+        off  = _ALL_STATE["offset"]
+        tot  = _ALL_STATE["total"]
+        pct  = off / tot * 100
+        await ctx.send(embed=discord.Embed(
+            title="🚀  AutoSweep — Démarré",
+            description=(f"> Chunk : `{chunk}` combos/itération\n"
+                         f"> Reprise depuis `{off:,}` / `{tot:,}` (`{pct:.4f}%`)\n"
+                         f"> Rapport toutes les `{_AUTO_STATE['report_every']}` itérations\n"
+                         f"> `+autosweep stop` pour arrêter à tout moment"),
+            color=C["check"]))
+
+    # ── STOP ───────────────────────────────────────────────────────────────────
+    elif action == "stop":
+        if not _AUTO_STATE["running"]:
+            await ctx.send(embed=make_embed("ℹ️  Pas en cours",
+                "> AutoSweep n'est pas actif.", C["info"])); return
+
+        _AUTO_STATE["running"] = False
+        if _AUTO_STATE["task"]:
+            _AUTO_STATE["task"].cancel()
+            _AUTO_STATE["task"] = None
+
+        off = _ALL_STATE["offset"]
+        tot = _ALL_STATE["total"]
+        await ctx.send(embed=discord.Embed(
+            title="⏹️  AutoSweep — Arrêté",
+            description=(f"> Progression sauvegardée : `{off:,}` / `{tot:,}` (`{off/tot*100:.4f}%`)\n"
+                         f"> Pseudos trouvés : `{_AUTO_STATE['found_total']}`\n"
+                         f"> `+autosweep start` pour reprendre."),
+            color=C["warn"]))
+
+    # ── STATUS ─────────────────────────────────────────────────────────────────
+    elif action == "status":
+        off     = _ALL_STATE["offset"]
+        tot     = _ALL_STATE["total"]
+        pct     = off / tot * 100
+        running = _AUTO_STATE["running"]
+        elapsed = time.time() - _AUTO_STATE["start_ts"] if running else 0
+        speed   = off / elapsed if elapsed > 1 else 0
+        eta_s   = int((tot - off) / speed) if speed > 0 else 0
+        eta_str = (f"{eta_s // 3600}h {(eta_s % 3600) // 60}m"
+                   if 0 < eta_s < 86400 * 30 else ("∞" if eta_s >= 86400 * 30 else "N/A"))
+
+        e = discord.Embed(
+            title=f"{'🟢' if running else '🔴'}  AutoSweep — {'En cours' if running else 'Arrêté'}",
+            color=C["check"] if running else C["error"])
+        e.add_field(name="Progression",
+                    value=f"`{off:,}` / `{tot:,}` (`{pct:.4f}%`)", inline=False)
+        e.add_field(name="Trouvés (session)",
+                    value=f"`{_AUTO_STATE['found_total']}`", inline=True)
+        e.add_field(name="ETA",
+                    value=f"`{eta_str}`", inline=True)
+        if running:
+            e.add_field(name="Vitesse",
+                        value=f"`{int(speed):,}` combos/s", inline=True)
+        e.set_footer(text="meanings · +autosweep start | stop | status")
+        await ctx.send(embed=e)
+
+    else:
+        await ctx.send(embed=make_embed("⚠️  Action inconnue",
+            "> `+autosweep start [chunk]` · `+autosweep stop` · `+autosweep status`",
+            C["warn"]))
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  🚀 LANCEMENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
