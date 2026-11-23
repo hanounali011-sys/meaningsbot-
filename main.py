@@ -38,7 +38,7 @@ for _fname, _url in _WORDLISTS.items():
 BOT_TOKEN   = os.environ.get("BOT_TOKEN",  "").strip()
 USER_TOKEN  = os.environ.get("USER_TOKEN", "").strip()
 CHECK_DELAY = 0.3
-MAX_RESULTS = 50
+MAX_RESULTS = 15
 PARALLEL    = 5
 PREFIX      = "+"
 START_TIME  = time.time()
@@ -513,62 +513,19 @@ def load_cities(path):
     return list(cities)
 
 
-def _city_is_known(name_raw: str, cleaned: str, max_len: int) -> bool:
-    """
-    Retourne True si la ville passe les filtres "ville connue" :
-      1. nom nettoyé <= max_len caractères
-      2. segments dans le nom original :
-           - 1 segment  → toujours OK si longueur ok  (Paris, Amiens, Lyon...)
-           - 2 segments → OK seulement si nettoyé <= 10  (Saint-Malo, New York...)
-           - 3+ segments → toujours rejeté  (Saint-Foy-lès-Lyon, Fontenay-sous-Bois...)
-    """
-    if len(cleaned) > max_len:
-        return False
-    segments = re.split(r'[\s\-\.]+', name_raw.strip())
-    n = len(segments)
-    if n >= 3:
-        return False
-    if n == 2 and len(cleaned) > 10:
-        return False
-    return True
-
-
-def load_cities_by_country(path, min_pop: int = 0, max_len: int = 11):
-    """
-    Retourne un dict {country_name_lower: [villes]} depuis le CSV world-cities.
-    Filtres appliqués :
-      - population >= min_pop  si la colonne existe dans le CSV
-      - nom original <= 2 segments (pas de Saint-Foy-lès-Lyon)
-      - longueur nom nettoyé <= max_len
-    """
+def load_cities_by_country(path):
+    """Retourne un dict {country_code_lower: [villes]} depuis le CSV world-cities."""
     result = {}
     if not os.path.exists(path): return result
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
-            reader = csv.DictReader(f)
-            has_pop = None
-            for row in reader:
+            for row in csv.DictReader(f):
                 name    = row.get("name", "").strip()
                 country = row.get("country", "").strip().lower()
                 if not name or not country: continue
-
-                if has_pop is None:
-                    has_pop = "population" in row
-
-                if has_pop:
-                    try:
-                        pop = int(row.get("population", 0) or 0)
-                    except ValueError:
-                        pop = 0
-                    if pop < min_pop:
-                        continue
-
                 cleaned = re.sub(r'[^a-z]', '', strip_accents(name.lower()))
-                if len(cleaned) < 3:
-                    continue
-                if not _city_is_known(name, cleaned, max_len):
-                    continue
-                result.setdefault(country, set()).add(cleaned)
+                if 3 <= len(cleaned) <= 20:
+                    result.setdefault(country, set()).add(cleaned)
     except Exception as e:
         print(f"[WARN] villes_by_country : {e}")
     return {k: list(v) for k, v in result.items()}
@@ -578,7 +535,6 @@ print("[*] Chargement des dicos...")
 _loaded_fr     = load_wordlist("words_fr.json")
 _loaded_en     = load_wordlist("words_en.txt")
 _loaded_cities = load_cities("words_cities.csv")
-_loaded_cities_by_country = load_cities_by_country("words_cities.csv")
 
 BUILTIN_FR = ["lune","soleil","etoile","ciel","nuage","brume","orage","tonnerre","eclair",
     "pluie","neige","givre","glace","vent","tempete","montagne","vallee","desert","foret",
@@ -588,90 +544,8 @@ BUILTIN_EN = ["moon","sun","star","sky","cloud","mist","storm","thunder","lightn
     "snow","frost","ice","wind","gale","mountain","valley","desert","forest","ocean","sea",
     "lake","river","waterfall","wave","island","cliff","cave","rock","flame","flower","rose"]
 
-def _sort_pseudo_quality(words: list) -> list:
-    """
-    Trie les mots par score "qualité pseudo" décroissant.
-    Rien n'est supprimé — les conjugaisons rares et mots longs arrivent en queue.
-
-    Score (plus bas = meilleur, trié croissant) :
-      +0  longueur 3–6   (OG, court)
-      +1  longueur 7–9   (moyen)
-      +2  longueur 10+   (long)
-      +0  pas de suffixe de conjugaison rare
-      +2  suffixe rare (aient, erais, assiez, ions, iez…)
-      +0  prononçable (≤3 consonnes de suite)
-      +1  4 consonnes de suite
-      +2  5+ consonnes de suite
-    """
-    RARE_SUFFIXES = (
-        "assiez", "assions", "eraient", "eriez", "erions",
-        "erait", "erais", "aient", "iez",
-        "asses", "asse",
-    )
-    VOWELS = set("aeiouy")
-
-    def _cons_run(w):
-        best = cur = 0
-        for c in w:
-            if c not in VOWELS: cur += 1; best = max(best, cur)
-            else: cur = 0
-        return best
-
-    def _score(w):
-        s = 0
-        n = len(w)
-        if n <= 6:   s += 0
-        elif n <= 9: s += 1
-        else:        s += 2
-        if any(w.endswith(sf) for sf in RARE_SUFFIXES): s += 2
-        cr = _cons_run(w)
-        if cr >= 5:   s += 2
-        elif cr >= 4: s += 1
-        return s
-
-    return sorted(words, key=_score)
-
-
-FR_CONJ = (
-    "eraient", "assions", "assiez", "erions", "eriez", "eront", "erons", "erez", "eras",
-    "erais", "erait", "erai", "aient", "ions", "iez", "ais", "ait", "ant", "ons", "ez",
-    "ees", "ee", "ues", "ies", "es", "ent", "era", "rai", "ras", "ront",
-)
-
-
-def _sort_fr_conjugated_first(words: list) -> list:
-    """
-    FR : met EN PREMIER les mots "genre dico long" : conjugaisons / pluriels / mots de 7-14 lettres
-    (ex: expliqueras, detruirons, embeterai, reconnaissait, courageuses...).
-    Les petits mots courants (probablement déjà pris) passent en queue. Rien n'est supprimé.
-    Score (plus bas = d'abord) :
-      0 : conjugaison/pluriel ET longueur 7-14
-      1 : conjugaison/pluriel OU longueur 7-14
-      2 : le reste (mots courts courants)
-    À score égal, les mots les plus longs d'abord.
-    """
-    CONJ = FR_CONJ
-
-    def _score(w):
-        n = len(w)
-        conj = w.endswith(CONJ)
-        good_len = 7 <= n <= 14
-        if conj and good_len: return (0, -n)
-        if conj or good_len:  return (1, -n)
-        return (2, -n)
-
-    return sorted(words, key=_score)
-
-
-ALL_FR = _sort_fr_conjugated_first(_loaded_fr if _loaded_fr else BUILTIN_FR)
-
-# Sous-liste "genre dico long" (mots de 7-14 lettres) : c'est elle que les
-# commandes FR piochent, pour que le MAXIMUM de résultats soient de ce genre.
-# (build_pool mélange la liste -> le simple tri ne suffisait pas ; on filtre donc la source.)
-ALL_FR_GENRE = [w for w in ALL_FR if 7 <= len(w) <= 14]   # mots de 7-14 lettres (conjugués, pluriels, noms longs...)
-if len(ALL_FR_GENRE) < 200:          # sécurité : dico trop petit/absent -> liste complète
-    ALL_FR_GENRE = ALL_FR
-ALL_EN = _sort_pseudo_quality(_loaded_en if _loaded_en else BUILTIN_EN)
+ALL_FR = _loaded_fr if _loaded_fr else BUILTIN_FR
+ALL_EN = _loaded_en if _loaded_en else BUILTIN_EN
 
 FAMOUS_CITIES = [
     "paris","london","berlin","tokyo","rome","madrid","barcelona","amsterdam","vienna","prague",
@@ -690,58 +564,6 @@ if _loaded_cities:
     ALL_CITIES = FAMOUS_CITIES + [c for c in _loaded_cities if c not in _famous_set]
 else:
     ALL_CITIES = FAMOUS_CITIES
-
-# dict {country_name_lower: [villes]} chargé depuis le CSV
-ALL_CITIES_BY_COUNTRY = _loaded_cities_by_country  # ex: {"france": [...], "germany": [...]}
-
-# Index construit au runtime : 2 premières lettres du nom pays CSV → liste de clés
-# ex: "fr" → ["france"], "ge" → ["germany","georgia"], "un" → ["united states","united kingdom",...]
-_COUNTRY_PREFIX_INDEX: dict[str, list[str]] = {}
-
-def _build_prefix_index():
-    for country_key in ALL_CITIES_BY_COUNTRY:
-        prefix = country_key[:2]
-        _COUNTRY_PREFIX_INDEX.setdefault(prefix, []).append(country_key)
-
-_build_prefix_index()
-
-
-def _resolve_country(arg: str):
-    """
-    Résout un argument vers la clé du dict ALL_CITIES_BY_COUNTRY.
-    Priorité :
-      1) correspondance exacte sur le nom complet  (ex: "france")
-      2) 2 premières lettres du nom pays CSV        (ex: "fr" → "france")
-         — si collision (ex: "ge" → germany/georgia) : prend le plus peuplé (liste la plus longue)
-      3) correspondance partielle début de nom       (ex: "germ" → "germany")
-    Retourne (clé_trouvée, label_affiché) ou (None, None).
-    """
-    a = arg.strip().lower()
-
-    # 1) exact
-    if a in ALL_CITIES_BY_COUNTRY:
-        return a, a.title()
-
-    # 2) 2 premières lettres → index préfixe
-    if len(a) == 2 and a in _COUNTRY_PREFIX_INDEX:
-        candidates = _COUNTRY_PREFIX_INDEX[a]
-        # en cas de collision prendre le pays avec le plus de villes (pool le plus riche)
-        best = max(candidates, key=lambda k: len(ALL_CITIES_BY_COUNTRY[k]))
-        return best, best.title()
-
-    # 3) partiel sur début de nom (3+ lettres)
-    starts = [k for k in ALL_CITIES_BY_COUNTRY if k.startswith(a)]
-    if starts:
-        best = max(starts, key=lambda k: len(ALL_CITIES_BY_COUNTRY[k]))
-        return best, best.title()
-
-    # 4) partiel contenu (fallback)
-    contains = [k for k in ALL_CITIES_BY_COUNTRY if a in k]
-    if contains:
-        best = max(contains, key=lambda k: len(ALL_CITIES_BY_COUNTRY[k]))
-        return best, best.title()
-
-    return None, None
 
 LANGS = {
     "de": ["wald","stein","berg","fluss","see","mond","sonne","wind","feuer","wasser","erde",
@@ -1052,8 +874,8 @@ async def run_scan(ctx, word_list, label, color, flag,
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
     if speed is None: speed = CONFIG["check_delay"]
-    limit = max(1, min(limit, 50))
-    n = min(max(limit * 20, 100), 800)
+    limit = max(1, min(limit, 30))
+    n = min(max(limit * 6, 30), 200)
     STATS["scans"] += 1
     msg = await ctx.send(embed=make_embed(description=f"```\n⏳  Génération — {label}...\n```", footer="scan en cours"))
     try:
@@ -1078,8 +900,8 @@ async def run_vanity_scan(ctx, word_list, label, color, flag,
                           limit=MAX_RESULTS, min_len=3, max_len=16, speed=None,
                           preserve_order=False):
     if speed is None: speed = CONFIG["check_delay"]
-    limit = max(1, min(limit, 50))
-    n = min(max(limit * 20, 100), 800)
+    limit = max(1, min(limit, 30))
+    n = min(max(limit * 6, 30), 200)
     STATS["scans"] += 1
     msg = await ctx.send(embed=make_embed(description=f"```\n⏳  Vanity — {label}...\n```", footer="scan en cours"))
     try:
@@ -1136,8 +958,8 @@ def _len_cmd(exact):
                  9:C["fr"],10:C["fr"],11:C["en"],12:C["en"]}.get(exact, C["info"])
         rarity = {3:"🔴 Extrêmement rares",4:"🟠 Très rares",5:"🟡 Rares",
                   6:"🟢 Peu communs",7:"🔵 Communs"}.get(exact, "⚪ Fréquents")
-        limit_real = max(1, min(limit, 50))
-        n = min(max(limit_real * 20, 100), 800)
+        limit_real = max(1, min(limit, 30))
+        n = min(max(limit_real * 6, 30), 200)
         STATS["scans"] += 1
         msg = await ctx.send(embed=make_embed(
             description=f"```\n🔢  Scan {exact} chars exactement...\n{rarity}\n```",
@@ -1184,16 +1006,16 @@ for _n in range(3, 13):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _fr_mix():
-    return random.sample(ALL_FR_GENRE, min(300, len(ALL_FR_GENRE))) + random.sample(ALL_EN, min(300, len(ALL_EN)))
+    return random.sample(ALL_FR, min(300, len(ALL_FR))) + random.sample(ALL_EN, min(300, len(ALL_EN)))
 
 
 _DICT_SCANS = [
-    ("meaningfr",  lambda: ALL_FR_GENRE, "FR", "fr", "🇫🇷", {}),
-    ("meaningfr2", lambda: random.sample(ALL_FR_GENRE, min(500, len(ALL_FR_GENRE))), "FR²", "fr", "🇫🇷", {}),
+    ("meaningfr",  lambda: ALL_FR, "FR", "fr", "🇫🇷", {}),
+    ("meaningfr2", lambda: random.sample(ALL_FR, min(500, len(ALL_FR))), "FR²", "fr", "🇫🇷", {}),
     ("frshort",    lambda: ALL_FR, "FR SHORT", "short", "⚡🇫🇷", {"min_len": 3, "max_len": 5}),
-    ("frlong",     lambda: ALL_FR_GENRE, "FR LONG", "fr", "📏🇫🇷", {"min_len": 8, "max_len": 16}),
-    ("fraesthetic",lambda: ALL_FR_GENRE, "FR AESTHETIC", "aesthetic", "✨🇫🇷", {"aesthetic": True}),
-    ("frleet",     lambda: ALL_FR_GENRE, "FR L33T", "cyber", "💻🇫🇷", {"leet": True}),
+    ("frlong",     lambda: ALL_FR, "FR LONG", "fr", "📏🇫🇷", {"min_len": 8, "max_len": 16}),
+    ("fraesthetic",lambda: ALL_FR, "FR AESTHETIC", "aesthetic", "✨🇫🇷", {"aesthetic": True}),
+    ("frleet",     lambda: ALL_FR, "FR L33T", "cyber", "💻🇫🇷", {"leet": True}),
     ("meaningen",  lambda: ALL_EN, "EN", "en", "🇬🇧", {}),
     ("meaningen2", lambda: random.sample(ALL_EN, min(500, len(ALL_EN))), "EN²", "en", "🇬🇧", {}),
     ("enshort",    lambda: ALL_EN, "EN SHORT", "short", "⚡🇬🇧", {"min_len": 3, "max_len": 5}),
@@ -1263,7 +1085,7 @@ def _sized_cmd(size, flag, label, color, speed=None):
     async def _inner(ctx, limit: int = MAX_RESULTS):
         if not USER_TOKEN:
             await ctx.send(embed=token_missing_embed()); return
-        limit = max(1, min(limit, 50))
+        limit = max(1, min(limit, 30))
         STATS["scans"] += 1
         msg = await ctx.send(embed=make_embed(description=f"```\n{flag}  {label} — {size} candidats...\n```", footer=label.lower()))
         candidates = await build_pool_async(ALL_FR + ALL_EN, size, 3, 16)
@@ -1325,7 +1147,7 @@ async def cmd_4c(ctx, limit: int = MAX_RESULTS):
     """Scan aléatoire de pseudos 4 chars (a-z + 0-9). Usage: +4calnum [nombre]"""
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
-    limit = max(1, min(limit, 50))
+    limit = max(1, min(limit, 30))
     STATS["scans"] += 1
     n_candidates = max(limit * 10, 200)
     candidates = _gen_4c_random(n_candidates)
@@ -1349,7 +1171,7 @@ async def cmd_4cletters(ctx, limit: int = MAX_RESULTS):
     """Scan aléatoire 4 chars lettres seulement (a-z). Usage: +4cletters [nombre]"""
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
-    limit = max(1, min(limit, 50))
+    limit = max(1, min(limit, 30))
     STATS["scans"] += 1
     candidates = _gen_4c_random(max(limit * 10, 200), _CHARS_ALPHA)
     msg = await ctx.send(embed=make_embed(
@@ -1371,7 +1193,7 @@ async def cmd_4cdigits(ctx, limit: int = MAX_RESULTS):
     """Scan aléatoire 4 chars chiffres seulement (0-9). Usage: +4cdigits [nombre]"""
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
-    limit = max(1, min(limit, 50))
+    limit = max(1, min(limit, 30))
     STATS["scans"] += 1
     candidates = _gen_4c_random(max(limit * 10, 200), _CHARS_DIGIT)
     msg = await ctx.send(embed=make_embed(
@@ -1388,33 +1210,102 @@ async def cmd_4cdigits(ctx, limit: int = MAX_RESULTS):
     await msg.edit(embed=result_embed(found, checked, "🔢", "4C DIGITS", C["og"]))
 
 
-# State pour le sweep exhaustif (persist en mémoire pendant la session)
-_4C_SWEEP_STATE = {"offset": 0, "total": len(_CHARS_ALNUM) ** 4}  # 1 679 616
+# ── SWEEPS EXHAUSTIFS (4, 5, 6 caractères — a-z + 0-9) ───────────────────────
+# 4C : 38^4 = 2 085 136 (a-z 0-9 _ .) · 5C : 36^5 = 60 466 176 · 6C : 36^6 = 2 176 782 336
+# Les combos sont générées à la volée à partir d'un offset (aucune liste géante en RAM).
+SWEEP_CHUNK  = 1000   # combos testées par commande
+SWEEP_LENGTHS = (4, 5, 6)
+# Alphabet complet autorisé par Discord pour un pseudo : a-z, 0-9, "_" et "."
+# (règle Discord : pas deux "." consécutifs → ces combos sont ignorées automatiquement)
+_CHARS_FULL = _CHARS_ALNUM + ["_", "."]          # 38 chars → 38^4 = 2 085 136 combos brutes
+SWEEP_CHARSETS = {4: _CHARS_FULL, 5: _CHARS_ALNUM, 6: _CHARS_ALNUM}
+_SWEEP_STATE = {n: {"offset": 0, "total": len(SWEEP_CHARSETS[n]) ** n} for n in SWEEP_LENGTHS}
+_4C_SWEEP_STATE = _SWEEP_STATE[4]  # compat
 
-@bot.command(name="4cfull")
-async def cmd_4cfull(ctx, limit: int = MAX_RESULTS):
-    """Sweep exhaustif 4C — parcourt toutes les 1 679 616 combos en ordre. Reprend où il s'est arrêté.
-    Usage: +4cfull [nombre]  |  +4cfull reset pour repartir de zéro"""
+
+def _gen_chunk(offset: int, size: int, length: int, charset=None) -> list:
+    """Slice déterministe de toutes les combos de `length` chars (ordre aaaa, aaab, ...)."""
+    cs = charset or _CHARS_ALNUM
+    base = len(cs)
+    result = []
+    for i in range(offset, min(offset + size, base ** length)):
+        tmp, combo = i, []
+        for _ in range(length):
+            combo.append(cs[tmp % base])
+            tmp //= base
+        result.append("".join(reversed(combo)))
+    return result
+
+
+def _gen_valid_chunk(offset: int, size: int, length: int, charset) -> tuple:
+    """Comme _gen_chunk mais ignore les pseudos invalides (".." consécutifs).
+    Retourne (mots, index_bruts) pour pouvoir avancer le pointeur exactement."""
+    words, idxs = [], []
+    base = len(charset)
+    for i in range(offset, min(offset + size, base ** length)):
+        tmp, combo = i, []
+        for _ in range(length):
+            combo.append(charset[tmp % base])
+            tmp //= base
+        w = "".join(reversed(combo))
+        if ".." in w:
+            continue
+        words.append(w); idxs.append(i)
+    return words, idxs
+
+
+def _sweep_word(offset: int, length: int) -> str:
+    cs = SWEEP_CHARSETS[length]
+    if offset >= len(cs) ** length:
+        return "-"
+    words, _ = _gen_valid_chunk(offset, 50, length, cs)
+    return words[0] if words else "-"
+
+
+async def _run_sweep(ctx, length: int, arg=None):
+    state = _SWEEP_STATE[length]
+    total = state["total"]
+
+    # +Ncfull reset
+    if arg and arg.lower() == "reset":
+        state["offset"] = 0
+        await ctx.send(embed=make_embed(f"✅  {length}C reset",
+            f"> Sweep remis à zéro. `+{length}cfull` reprend depuis `{'a' * length}`.", C["check"]))
+        return
+
+    # +Ncfull [nombre]
+    try:
+        limit = int(arg) if arg else CONFIG["max_results"]
+    except ValueError:
+        await ctx.send(embed=make_embed("⚠️  Argument invalide",
+            f"> Utilise `+{length}cfull [nombre]` ou `+{length}cfull reset`.", C["warn"]))
+        return
+
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
-    limit = max(1, min(limit, 50))
-    offset = _4C_SWEEP_STATE["offset"]
-    total  = _4C_SWEEP_STATE["total"]
+    limit = max(1, min(limit, 30))
+
+    offset = state["offset"]
     if offset >= total:
         await ctx.send(embed=make_embed("✅  Sweep terminé",
-            f"> Toutes les `{total:,}` combos ont été parcourues.\n> Utilise `+4cfull reset` pour recommencer.",
+            f"> Toutes les `{total:,}` combos ont été parcourues.\n> Utilise `+{length}cfull reset` pour recommencer.",
             C["check"]))
         return
-    batch = _4C_SWEEP_STATE["total"] - offset  # tout le restant d'un coup
-    candidates = _gen_4c_chunk(offset, batch)
+
+    candidates, idxs = _gen_valid_chunk(offset, SWEEP_CHUNK, length, SWEEP_CHARSETS[length])
+    if not candidates:   # tranche entièrement invalide : on la saute
+        state["offset"] = min(total, offset + SWEEP_CHUNK)
+        await ctx.send(embed=make_embed("⏭️  Tranche ignorée",
+            "> Aucune combinaison valide dans cette tranche, relance la commande.", C["warn"]))
+        return
     STATS["scans"] += 1
-    pct = int(offset / total * 100)
+    pct = offset / total * 100
     msg = await ctx.send(embed=make_embed(
-        description=f"```\n🗺️  4C FULL — offset {offset:,}/{total:,} ({pct}%)...\n```",
-        footer="4cfull sweep"))
+        description=f"```\n🗺️  {length}C FULL — offset {offset:,}/{total:,} ({pct:.4f}%)...\n```",
+        footer=f"{length}cfull sweep"))
     found, checked = await _scan_engine(
-        candidates, limit, msg, "🗺️", "4C FULL", C["og"], check_available, False, ctx)
-    _4C_SWEEP_STATE["offset"] = offset + batch
+        candidates, limit, msg, "🗺️", f"{length}C FULL", C["og"], check_available, False, ctx)
+
     if not found and checked == 0:
         remaining = max(0, int(RATE["until"] - time.time()))
         desc = (f"> Rate limit — réessaie dans ~`{remaining}s`." if remaining > 0
@@ -1422,32 +1313,136 @@ async def cmd_4cfull(ctx, limit: int = MAX_RESULTS):
         await msg.edit(embed=discord.Embed(title="❌  Token refusé ou limite Discord",
                                            description=desc, color=C["error"]))
         return
-    new_offset = _4C_SWEEP_STATE["offset"]
-    new_pct    = min(100, int(new_offset / total * 100))
-    e = result_embed(found, checked, "🗺️", "4C FULL", C["og"])
-    e.set_footer(text=f"meanings · sweep {new_offset:,}/{total:,} ({new_pct}%) — +4cfull pour continuer")
+
+    # On n'avance que de ce qui a réellement été vérifié (plus de saut à la fin).
+    state["offset"] = (idxs[min(checked, len(idxs)) - 1] + 1) if checked else offset
+    new_pct = state["offset"] / total * 100
+    e = result_embed(found, checked, "🗺️", f"{length}C FULL", C["og"])
+    e.set_footer(text=f"meanings · sweep {state['offset']:,}/{total:,} ({new_pct:.4f}%) — +{length}cfull pour continuer")
     await msg.edit(embed=e)
 
 
-@bot.command(name="4creset")
-async def cmd_4creset(ctx):
-    """Remet le pointeur du sweep +4cfull à zéro."""
-    _4C_SWEEP_STATE["offset"] = 0
-    await ctx.send(embed=make_embed("✅  4C reset",
-        f"> Sweep remis à zéro. `+4cfull` reprend depuis `aaaa`.", C["check"]))
+def _make_sweep_cmds(length: int):
+    async def _full(ctx, arg: str = None):
+        await _run_sweep(ctx, length, arg)
+
+    async def _reset(ctx):
+        await _run_sweep(ctx, length, "reset")
+
+    _full.__doc__ = f"Sweep exhaustif {length}C (toutes combos valides). Usage: +{length}cfull [nombre] | +{length}cfull reset"
+    _reset.__doc__ = f"Remet le sweep {length}C à zéro."
+    bot.command(name=f"{length}cfull")(_full)
+    bot.command(name=f"{length}creset")(_reset)
 
 
-@bot.command(name="4cstatus")
-async def cmd_4cstatus(ctx):
-    """Affiche la progression du sweep exhaustif 4C."""
-    offset = _4C_SWEEP_STATE["offset"]
-    total  = _4C_SWEEP_STATE["total"]
-    pct    = min(100, int(offset / total * 100))
-    remaining_combos = max(0, total - offset)
-    e = discord.Embed(title="🗺️  4C Sweep — Statut", color=C["og"])
-    e.add_field(name="Progression", value=f"`{offset:,}` / `{total:,}` ({pct}%)", inline=False)
-    e.add_field(name="Restant", value=f"`{remaining_combos:,}` combos", inline=True)
-    e.add_field(name="Prochain chunk", value=f"offset `{offset:,}`", inline=True)
+for _n in SWEEP_LENGTHS:
+    _make_sweep_cmds(_n)
+
+
+# ── SWEEP UNIQUE 2 → 6 CARACTÈRES (alphabet complet, ~3,09 milliards) ───────────
+ALL_LENGTHS = (2, 3, 4, 5, 6)
+_ALL_SIZES  = [len(_CHARS_FULL) ** n for n in ALL_LENGTHS]
+_ALL_STATE  = {"offset": 0, "total": sum(_ALL_SIZES)}   # 3 092 313 004 combos brutes
+
+
+def _all_locate(offset: int):
+    """offset global → (longueur, offset local, début global de cette longueur)."""
+    base = 0
+    for n, size in zip(ALL_LENGTHS, _ALL_SIZES):
+        if offset < base + size:
+            return n, offset - base, base
+        base += size
+    return None, 0, base
+
+
+async def _run_allsweep(ctx, arg=None):
+    total = _ALL_STATE["total"]
+
+    if arg and arg.lower() == "reset":
+        _ALL_STATE["offset"] = 0
+        await ctx.send(embed=make_embed("✅  ALL reset",
+            "> Sweep remis à zéro. `+allfull` reprend depuis `aa`.", C["check"]))
+        return
+
+    try:
+        limit = int(arg) if arg else CONFIG["max_results"]
+    except ValueError:
+        await ctx.send(embed=make_embed("⚠️  Argument invalide",
+            "> Utilise `+allfull [nombre]` ou `+allfull reset`.", C["warn"]))
+        return
+
+    if not USER_TOKEN:
+        await ctx.send(embed=token_missing_embed()); return
+    limit = max(1, min(limit, 30))
+
+    offset = _ALL_STATE["offset"]
+    length, local, base = _all_locate(offset)
+    if length is None:
+        await ctx.send(embed=make_embed("✅  Sweep terminé",
+            f"> Toutes les `{total:,}` combos ont été parcourues.\n> Utilise `+allfull reset` pour recommencer.",
+            C["check"]))
+        return
+
+    # une tranche ne chevauche jamais deux longueurs différentes
+    size = min(SWEEP_CHUNK, len(_CHARS_FULL) ** length - local)
+    candidates, idxs = _gen_valid_chunk(local, size, length, _CHARS_FULL)
+    if not candidates:
+        _ALL_STATE["offset"] = offset + size
+        await ctx.send(embed=make_embed("⏭️  Tranche ignorée",
+            "> Aucune combinaison valide dans cette tranche, relance la commande.", C["warn"]))
+        return
+
+    STATS["scans"] += 1
+    pct = offset / total * 100
+    msg = await ctx.send(embed=make_embed(
+        description=f"```\n🗺️  ALL FULL — {length} chars — offset {offset:,}/{total:,} ({pct:.5f}%)...\n```",
+        footer="allfull sweep"))
+    found, checked = await _scan_engine(
+        candidates, limit, msg, "🗺️", "ALL FULL", C["og"], check_available, False, ctx)
+
+    if not found and checked == 0:
+        remaining = max(0, int(RATE["until"] - time.time()))
+        desc = (f"> Rate limit — réessaie dans ~`{remaining}s`." if remaining > 0
+                else "> Token invalide ou expiré.")
+        await msg.edit(embed=discord.Embed(title="❌  Token refusé ou limite Discord",
+                                           description=desc, color=C["error"]))
+        return
+
+    if checked:
+        _ALL_STATE["offset"] = base + idxs[min(checked, len(idxs)) - 1] + 1
+    new_off = _ALL_STATE["offset"]
+    e = result_embed(found, checked, "🗺️", "ALL FULL", C["og"])
+    e.set_footer(text=f"meanings · sweep {new_off:,}/{total:,} ({new_off / total * 100:.5f}%) — +allfull pour continuer")
+    await msg.edit(embed=e)
+
+
+@bot.command(name="allfull", aliases=["megafull"])
+async def cmd_allfull(ctx, arg: str = None):
+    """Sweep unique 2→6 caractères (a-z 0-9 _ .) ~3,09 milliards. Usage: +allfull [nombre] | +allfull reset"""
+    await _run_allsweep(ctx, arg)
+
+
+@bot.command(name="allreset")
+async def cmd_allreset(ctx):
+    """Remet le sweep +allfull à zéro."""
+    await _run_allsweep(ctx, "reset")
+
+
+@bot.command(name="sweepstatus", aliases=["4cstatus", "5cstatus", "6cstatus"])
+async def cmd_sweepstatus(ctx):
+    """Progression des sweeps exhaustifs 4C / 5C / 6C."""
+    e = discord.Embed(title="🗺️  Sweeps — Statut", color=C["og"])
+    for n in SWEEP_LENGTHS:
+        st = _SWEEP_STATE[n]
+        pct = st["offset"] / st["total"] * 100
+        e.add_field(name=f"{n} caractères",
+                    value=f"`{st['offset']:,}` / `{st['total']:,}` ({pct:.4f}%)\nProchain : `{_sweep_word(st['offset'], n)}`",
+                    inline=False)
+    off, tot = _ALL_STATE["offset"], _ALL_STATE["total"]
+    ln, _, _ = _all_locate(off)
+    e.add_field(name="ALL (2 à 6 caractères)",
+                value=f"`{off:,}` / `{tot:,}` ({off / tot * 100:.5f}%)\nLongueur en cours : `{ln or '-'}`",
+                inline=False)
     await ctx.send(embed=e)
 
 
@@ -1548,44 +1543,8 @@ async def cmd_vanitymix(ctx, limit: int = MAX_RESULTS):
 
 
 @bot.command(name="vanitycity")
-async def cmd_vanitycity(ctx, *args):
-    """
-    +vanitycity [n]            — toutes les villes
-    +vanitycity <code> [n]     — villes d'un pays  ex: +vanitycity fr 10
-    +vanitycity <nom> [n]      — idem avec nom complet ex: +vanitycity germany 5
-    """
-    limit = CONFIG["max_results"]
-    country_arg = None
-
-    if args:
-        # dernier arg numérique = limit
-        if args[-1].isdigit():
-            limit = int(args[-1])
-            country_arg = " ".join(args[:-1]) if len(args) > 1 else None
-        else:
-            country_arg = " ".join(args)
-
-    limit = max(1, min(limit, 50))
-
-    if country_arg:
-        key, label = _resolve_country(country_arg)
-        if key is None:
-            await ctx.send(embed=make_embed(
-                description=f"❌ Pays introuvable : `{country_arg}`\nExemples : `fr`, `de`, `en`, `japan`, `brazil`",
-                color=C["error"], footer="vanitycity"))
-            return
-        pool = ALL_CITIES_BY_COUNTRY.get(key, [])
-        if not pool:
-            await ctx.send(embed=make_embed(
-                description=f"❌ Aucune ville trouvée pour `{label}` dans le CSV.",
-                color=C["error"], footer="vanitycity"))
-            return
-        flag_label = f"CITY · {label}"
-    else:
-        pool = ALL_CITIES
-        flag_label = "CITY"
-
-    await run_vanity_scan(ctx, pool, flag_label, C["city"], "🌍", limit, preserve_order=True)
+async def cmd_vanitycity(ctx, limit: int = MAX_RESULTS):
+    await run_vanity_scan(ctx, ALL_CITIES, "CITY", C["city"], "🌍", limit, preserve_order=True)
 
 
 @bot.command(name="vanityshort")
@@ -1611,7 +1570,7 @@ async def cmd_vanitycolors(ctx, limit: int = MAX_RESULTS):
 
 def _vanity_sized(size, flag, label, color):
     async def _inner(ctx, limit: int = MAX_RESULTS):
-        limit = max(1, min(limit, 50))
+        limit = max(1, min(limit, 30))
         STATS["scans"] += 1
         msg = await ctx.send(embed=make_embed(description=f"```\n{flag}  Vanity {label}...\n```", footer=f"vanity{label.lower()}"))
         raw = await build_pool_async(ALL_FR + ALL_EN, size, 3, 16)
@@ -1678,7 +1637,7 @@ async def _pool_scan(ctx, pool, limit, flag, label, color, intro, footer, n=80):
     STATS["scans"] += 1
     random.shuffle(pool)
     msg = await ctx.send(embed=make_embed(description=f"```\n{flag}  {intro}...\n```", footer=footer))
-    found, checked = await _scan_engine(pool[:n], max(1, min(limit, 50)), msg, flag, label, C[color], check_available, False, ctx)
+    found, checked = await _scan_engine(pool[:n], max(1, min(limit, 30)), msg, flag, label, C[color], check_available, False, ctx)
     await msg.edit(embed=result_embed(found, checked, flag, label, C[color]))
 
 
@@ -2869,7 +2828,7 @@ HELP_CATEGORIES = {
         (f"+meaning{c} [n]", f"Pseudos {c.upper()}") for c in ("de","es","it","pt","nl","pl","sv","no","jp","ko","ar","ru")]},
     "themes": {"emoji": "🎨", "label": "Thèmes Pseudos", "cmds": [(f"+{t[0]} [n]", t[2].title()) for t in _THEME_SCANS]},
     "vanity": {"emoji": "🔗", "label": "Vanity URLs", "cmds": [
-        ("+vanityfr [n]","FR"),("+vanityen [n]","EN"),("+vanitymix [n]","Mix"),("+vanitycity [pays] [n]","Villes (filtre pays optionnel)"),
+        ("+vanityfr [n]","FR"),("+vanityen [n]","EN"),("+vanitymix [n]","Mix"),("+vanitycity [n]","Villes"),
         ("+vanityshort [n]","Courts"),("+vanityog [n]","OG"),("+luckyvanity","1 vanity dispo"),
         ("+vanitymega [n]","300 candidats"),("+vanitydeep [n]","200 candidats"),("+vanitycolor [n]","Couleurs"),
     ] + [(f"+{t[0]} [n]", f"Vanity {t[2].title()}") for t in _VANITY_THEMES]},
@@ -2885,6 +2844,8 @@ HELP_CATEGORIES = {
         ("+style <mot>","Variantes style"),("+combine mot1 mot2","Combos"),("+suggest <mot>","Suggestions"),
         ("+from <mot>","Pseudos depuis un mot"),("+prefix <pfx>","Scan préfixe"),("+suffix <sfx>","Scan suffixe"),
         ("+contains <lettres>","Scan contenant"),
+        ("+4cfull [n|reset]","Sweep 4 chars a-z 0-9 _ . (2,08 M)"),("+5cfull [n|reset]","Sweep 5 chars (60 M)"),
+        ("+6cfull [n|reset]","Sweep 6 chars (2,18 Md)"),("+allfull [n|reset]","Sweep unique 2-6 chars (3,09 Md)"),("+sweepstatus","Progression des sweeps"),
     ]},
     "watch": {"emoji": "👀", "label": "Surveillance (Watch)", "cmds": [
         ("+watch <pseudo>","Surveille (6h)"),("+watchvanity <code>","Surveille une vanity"),
