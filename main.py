@@ -953,13 +953,14 @@ def _len_cmd(exact):
     async def _inner(ctx, limit: int = MAX_RESULTS):
         if not USER_TOKEN:
             await ctx.send(embed=token_missing_embed()); return
-        flag = {3:"⚡",4:"👑",5:"🔥",6:"✨",7:"💎",8:"🌟",9:"🎯",10:"🏆",11:"📌",12:"🎪"}.get(exact, "🔢")
-        color = {3:C["og"],4:C["og"],5:C["short"],6:C["short"],7:C["mix"],8:C["mix"],
-                 9:C["fr"],10:C["fr"],11:C["en"],12:C["en"]}.get(exact, C["info"])
+        flag   = {3:"⚡",4:"👑",5:"🔥",6:"✨",7:"💎",8:"🌟",9:"🎯",10:"🏆",11:"📌",12:"🎪"}.get(exact, "🔢")
+        color  = {3:C["og"],4:C["og"],5:C["short"],6:C["short"],7:C["mix"],8:C["mix"],
+                  9:C["fr"],10:C["fr"],11:C["en"],12:C["en"]}.get(exact, C["info"])
         rarity = {3:"🔴 Extrêmement rares",4:"🟠 Très rares",5:"🟡 Rares",
                   6:"🟢 Peu communs",7:"🔵 Communs"}.get(exact, "⚪ Fréquents")
         limit_real = max(1, min(limit, 30))
-        n = min(max(limit_real * 6, 30), 200)
+        # pool beaucoup plus large — les longueurs rares (9-12) ont peu de mots-clés exacts
+        n = min(max(limit_real * 20, 300), 1000)
         STATS["scans"] += 1
         msg = await ctx.send(embed=make_embed(
             description=f"```\n🔢  Scan {exact} chars exactement...\n{rarity}\n```",
@@ -967,20 +968,39 @@ def _len_cmd(exact):
 
         def build():
             mixed = ALL_FR + ALL_EN
+            # 1. mots de longueur exacte dans les dicos
             pool = list({w for w in mixed if len(w) == exact and is_valid(w)})
-            short = [w for w in mixed if 2 <= len(w) <= exact - 1]
+            seen = set(pool)
+
+            # 2. combos a+b et b+a de longueur exacte
+            short = [w for w in mixed if 2 <= len(w) <= exact - 2 and is_valid(w)]
             random.shuffle(short)
-            for a, b in itertools.combinations(short[:200], 2):
-                if len(a) + len(b) == exact:
-                    combo = a + b
-                    if is_valid(combo): pool.append(combo)
-                if len(pool) > 500: break
+            for a, b in itertools.combinations(short[:500], 2):
+                for combo in (a + b, b + a):
+                    if len(combo) == exact and combo not in seen and is_valid(combo):
+                        pool.append(combo)
+                        seen.add(combo)
+                if len(pool) >= n * 2:
+                    break
+
+            # 3. fallback alphabétique — génère des strings a-z de longueur exacte
+            #    garantit un pool plein même pour len9-12 où les dicos sont creux
+            if len(pool) < n:
+                chars = list("abcdefghijklmnopqrstuvwxyz")
+                attempts = 0
+                while len(pool) < n and attempts < n * 50:
+                    attempts += 1
+                    candidate = "".join(random.choices(chars, k=exact))
+                    if candidate not in seen and is_valid(candidate):
+                        pool.append(candidate)
+                        seen.add(candidate)
+
             random.shuffle(pool)
             return pool[:n]
 
         candidates = await asyncio.to_thread(build)
-        found, checked = await _scan_engine(candidates, limit_real, msg, flag, f"{exact}C", color,
-                                            check_available, False, ctx)
+        found, checked = await _scan_engine(candidates, limit_real, msg, flag,
+                                            f"{exact}C", color, check_available, False, ctx)
         if found:
             lines = "\n".join(f"> `{p}`" for p in found)
             e = discord.Embed(
@@ -988,8 +1008,12 @@ def _len_cmd(exact):
                 description=f"> **{rarity}**\n\n{lines}", color=color)
             e.set_footer(text=f"meanings · {checked} scannés · {exact} chars exactement")
         else:
-            e = make_embed(f"{flag}  Aucun pseudo {exact}C", f"> {rarity}\n> Relance pour réessayer.",
-                           C["error"], f"{checked} scannés")
+            remaining = max(0, int(RATE["until"] - time.time()))
+            desc = (f"> Rate limit Discord — réessaie dans ~`{remaining}s`." if remaining > 0
+                    else f"> {rarity}\n> Relance pour réessayer.")
+            e = make_embed(f"{flag}  Aucun pseudo {exact}C", desc,
+                           C["warn"] if remaining > 0 else C["error"],
+                           f"{checked} scannés")
         await msg.edit(embed=e)
     return _inner
 
@@ -999,6 +1023,107 @@ for _n in range(3, 13):
     bot.command(name=f"len{_n}")(_f)
     bot.command(name=f"{_n}c")(_len_cmd(_n))
     bot.command(name=f"{_n}l")(_len_cmd(_n))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  🔀 COMBOS LETTRES+CHIFFRES / CHIFFRES+LETTRES (4→8 chars)
+#  +combo4   → 4 chars : lettres+chiffres mélangés (ex: ab12, x9kz)
+#  +combo4l  → 4 lettres uniquement         (ex: abcd)
+#  +combo4d  → 4 chiffres uniquement        (ex: 1234)
+#  +combo5   → 5 chars mixtes, etc.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _gen_combo(length: int, mode: str, n: int) -> list:
+    """
+    Génère n combinaisons uniques de longueur `length`.
+    mode : 'alpha'  → a-z seulement
+           'digit'  → 0-9 seulement
+           'alnum'  → a-z + 0-9 mélangés
+           'letter_num' → commence par lettres, finit par chiffres (ex: abc12)
+           'num_letter' → commence par chiffres, finit par lettres (ex: 12abc)
+    """
+    alpha  = list("abcdefghijklmnopqrstuvwxyz")
+    digit  = list("0123456789")
+    alnum  = alpha + digit
+    seen   = set()
+    result = []
+    max_tries = n * 30
+
+    for _ in range(max_tries):
+        if len(result) >= n:
+            break
+        if mode == "alpha":
+            w = "".join(random.choices(alpha, k=length))
+        elif mode == "digit":
+            w = "".join(random.choices(digit, k=length))
+        elif mode == "alnum":
+            w = "".join(random.choices(alnum, k=length))
+        elif mode == "letter_num":
+            # moitié lettres | moitié chiffres  (arrondi vers lettres)
+            nl = (length + 1) // 2
+            nd = length - nl
+            w = "".join(random.choices(alpha, k=nl)) + "".join(random.choices(digit, k=nd))
+        elif mode == "num_letter":
+            nd = length // 2
+            nl = length - nd
+            w = "".join(random.choices(digit, k=nd)) + "".join(random.choices(alpha, k=nl))
+        else:
+            w = "".join(random.choices(alnum, k=length))
+
+        if w not in seen and is_valid(w):
+            seen.add(w)
+            result.append(w)
+
+    return result
+
+
+def _make_combo_cmd(length: int, mode: str, flag: str, label: str, color_key: str):
+    async def _inner(ctx, limit: int = MAX_RESULTS):
+        if not USER_TOKEN:
+            await ctx.send(embed=token_missing_embed()); return
+        limit_real = max(1, min(limit, 30))
+        n = max(limit_real * 20, 400)
+        STATS["scans"] += 1
+        msg = await ctx.send(embed=make_embed(
+            description=f"```\n{flag}  {label} — génération...\n```",
+            footer=f"{label.lower()} scan"))
+        candidates = await asyncio.to_thread(_gen_combo, length, mode, n)
+        found, checked = await _scan_engine(
+            candidates, limit_real, msg, flag, label, C[color_key], check_available, False, ctx)
+        if not found and checked == 0:
+            remaining = max(0, int(RATE["until"] - time.time()))
+            desc = (f"> Rate limit — réessaie dans ~`{remaining}s`." if remaining > 0
+                    else "> Token invalide ou expiré.")
+            await msg.edit(embed=discord.Embed(
+                title="❌  Token refusé ou limite Discord", description=desc, color=C["error"]))
+            return
+        if found:
+            lines = "\n".join(f"> `{p}`" for p in found)
+            e = discord.Embed(
+                title=f"{flag}  {len(found)} pseudo{'s' if len(found)>1 else ''} · {label}",
+                description=lines, color=C[color_key])
+            e.set_footer(text=f"meanings · {checked} scannés · {length} chars exactement")
+        else:
+            e = make_embed(f"{flag}  Aucun pseudo {label}",
+                           f"> Relance pour réessayer.", C["error"], f"{checked} scannés")
+        await msg.edit(embed=e)
+    _inner.__doc__ = f"Scan {label}. Usage: +{label.lower().replace(' ','')} [nombre]"
+    return _inner
+
+
+# Tableau : (longueur, mode, flag, label, couleur)
+_COMBO_CMDS = []
+for _cl in range(4, 9):   # 4 → 8 chars
+    _COMBO_CMDS += [
+        (f"combo{_cl}",   _cl, "alnum",       "🔀", f"COMBO{_cl}",   "og"),
+        (f"combo{_cl}l",  _cl, "alpha",        "🔡", f"COMBO{_cl}L",  "mix"),
+        (f"combo{_cl}d",  _cl, "digit",        "🔢", f"COMBO{_cl}D",  "fr"),
+        (f"combo{_cl}ln", _cl, "letter_num",   "🔣", f"COMBO{_cl}LN", "cyber"),
+        (f"combo{_cl}nl", _cl, "num_letter",   "🔣", f"COMBO{_cl}NL", "cyber"),
+    ]
+
+for _cmd_name, _cl, _mode, _flag, _label, _col in _COMBO_CMDS:
+    bot.command(name=_cmd_name)(_make_combo_cmd(_cl, _mode, _flag, _label, _col))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
