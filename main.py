@@ -2878,118 +2878,223 @@ HELP_CATEGORIES = {
 }
 
 
-def _build_help_home_embed():
-    e = discord.Embed(title="Help - meanings", description=(
-        "**Bienvenue dans le système d'aide de meanings !**\n\n"
-        "Sélectionnez une catégorie avec `+help <catégorie>`.\n"
-        f"Commandes disponibles : `{TOTAL_CMDS}` · Préfixe : `+`\n​"), color=C["info"])
-    e.add_field(name="​", value="\n".join(
-        f"`{len(c['cmds']):02d}`  **{c['label']}**  (`{k}`)" for k, c in HELP_CATEGORIES.items()), inline=False)
-    e.add_field(name="🚀  Quickstart", value=(
-        "`+meaningen 5` — 5 pseudos EN\n`+og 3` — 3 OG 4-6 chars\n`+4c 5` — 5 pseudos de 4 chars\n"
-        "`+check storm` — vérifier un pseudo\n`+checkall storm` — pseudo + vanity\n"
-        "`+dark 5` — thème dark\n`+lucky` — 1 pseudo rapide"), inline=False)
-    e.set_footer(text=f"meanings v4.0 · {len(ALL_FR):,} FR · {len(ALL_EN):,} EN · {len(ALL_CITIES):,} villes · {len(THEMES)} thèmes")
-    return e
+import difflib
+
+# ── Style "Help" : accueil + menu déroulant, pages Précédent / Suivant ───────
+_ARG_RE = re.compile(r"\s+(\[|<|mot\d|\S*\.\.\.).*$")
 
 
-def _chunk_fields(chunk_cmds, limit=1000):
-    """Découpe une liste de chips en valeurs de champ < 1024 caractères."""
-    out, cur = [], ""
-    for c in chunk_cmds:
-        chip = f"`{c[0]}`"
-        if len(cur) + len(chip) + 2 > limit:
-            out.append(cur); cur = chip
-        else:
-            cur = f"{cur}, {chip}" if cur else chip
-    if cur: out.append(cur)
+def _cmd_names(usage):
+    """'+check <pseudo>' -> ['+check'] · '+len3 [n] / +3c [n]' -> ['+len3', '+3c']"""
+    out = []
+    for part in usage.split(" / "):
+        n = _ARG_RE.sub("", part.strip()).strip()
+        if n:
+            out.append(n)
+    return out or [usage.strip()]
+
+
+def _chip_names(cat):
+    seen, out = set(), []
+    for usage, _ in cat["cmds"]:
+        n = _cmd_names(usage)[0]
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
     return out
 
 
-def _build_helpall_cat_pages(key):
+def _find_cmd(query):
+    q = query.lower().lstrip("+").strip()
+    for key, cat in HELP_CATEGORIES.items():
+        for usage, desc in cat["cmds"]:
+            names = [n.lstrip("+").lower() for n in _cmd_names(usage)]
+            if q in names:
+                return key, cat, usage, desc, _cmd_names(usage)
+    return None
+
+
+def _build_help_home_embed():
+    lines = "\n".join(f"`{len(c['cmds']):02d}`  **{c['label']}**" for c in HELP_CATEGORIES.values())
+    e = discord.Embed(
+        title="Help - meanings",
+        description=(
+            "**Bienvenue dans le système d'aide de meanings !**\n\n"
+            "Sélectionnez une catégorie ci-dessous pour découvrir toutes les commandes disponibles.\n"
+            f"Commandes disponibles : `{TOTAL_CMDS}` · Préfixe : `+`\n\n"
+            f"{lines}\n\n"
+            "`+help <commande>` · `+help <catégorie>` · `+help all`"),
+        color=C["info"])
+    e.set_footer(text="✦ meanings")
+    return e
+
+
+def _pack(blocks, budget=3600):
+    pages, cur = [], ""
+    for b in blocks:
+        if cur and len(cur) + len(b) + 2 > budget:
+            pages.append(cur)
+            cur = b
+        else:
+            cur = f"{cur}\n\n{b}" if cur else b
+    if cur:
+        pages.append(cur)
+    return pages
+
+
+def _build_cat_pages(key):
+    """Catégorie détaillée : `usage` — description."""
     cat = HELP_CATEGORIES[key]
-    cmds, per = cat["cmds"], 12
-    total_pg = math.ceil(len(cmds) / per)
-    pages = []
-    for i in range(0, len(cmds), per):
-        chunk = cmds[i:i + per]
-        desc = "\n".join(f"`{c[0]}` — {c[1]}" for c in chunk)
-        e = discord.Embed(title=f"{cat['emoji']}  {cat['label']} ({len(cmds)})", description=desc, color=C["info"])
-        e.set_footer(text=f"meanings · {key} · page {i // per + 1}/{total_pg}")
-        pages.append(e)
-    return pages
+    lines = [f"`{u}` — {d}" for u, d in cat["cmds"]]
+    pages, cur = [], ""
+    for ln in lines:
+        if cur and len(cur) + len(ln) + 1 > 3600:
+            pages.append(cur)
+            cur = ln
+        else:
+            cur = f"{cur}\n{ln}" if cur else ln
+    if cur:
+        pages.append(cur)
+    out = []
+    for i, p in enumerate(pages):
+        e = discord.Embed(title=f"{cat['emoji']}  {cat['label']} ({len(cat['cmds'])})", description=p, color=C["info"])
+        e.set_footer(text=f"✦ {cat['label']} · page {i + 1}/{len(pages)}")
+        out.append(e)
+    return out
 
 
-def _build_helpall_pages():
-    cat_items = list(HELP_CATEGORIES.items())
-    pages = []
-    per_page = 3
-    total_pg = math.ceil(len(cat_items) / per_page)
-    for i in range(0, len(cat_items), per_page):
-        e = discord.Embed(title=f"✦  Commandes · {TOTAL_CMDS}", color=C["info"])
-        for key, cat in cat_items[i:i + per_page]:
-            shown = cat["cmds"][:25]
-            chips = _chunk_fields(shown)[0] if shown else ""
-            if len(cat["cmds"]) > len(shown): chips += ", ..."
-            e.add_field(name=f"{cat['emoji']}  {cat['label']} ({len(cat['cmds'])})",
-                        value=f"{chips}\n`+helpall {key}` pour tout voir", inline=False)
-        e.set_footer(text=f"meanings v4.0 · préfixe + · page {i // per_page + 1}/{total_pg}")
-        pages.append(e)
-    return pages
+def _build_all_pages():
+    """Toutes les catégories en listes de puces compactes (comme =help all)."""
+    blocks = []
+    for key, cat in HELP_CATEGORIES.items():
+        total = len(cat["cmds"])
+        chunks, cur = [], ""
+        for n in _chip_names(cat):
+            chip = f"`{n}`"
+            add = chip if not cur else f", {chip}"
+            if len(cur) + len(add) > 1500:
+                chunks.append(cur)
+                cur = chip
+            else:
+                cur += add
+        if cur:
+            chunks.append(cur)
+        for i, ch in enumerate(chunks):
+            blocks.append(f"**{cat['label']} ({total})**{' · suite' if i else ''}\n{ch}")
+    pages = _pack(blocks)
+    out = []
+    for i, p in enumerate(pages):
+        e = discord.Embed(title="Help - meanings", description=p, color=C["info"])
+        e.set_footer(text=f"✦ Commandes · page {i + 1}/{len(pages)}")
+        out.append(e)
+    return out
+
+
+class HelpSelect(discord.ui.Select):
+    def __init__(self, current="home"):
+        opts = [discord.SelectOption(label="Accueil", value="home", emoji="🏠", default=(current == "home"))]
+        for k, c in HELP_CATEGORIES.items():
+            opts.append(discord.SelectOption(label=c["label"][:100], value=k, emoji=c["emoji"],
+                                             description=f"{len(c['cmds'])} commandes", default=(current == k)))
+        super().__init__(placeholder="Accueil", min_values=1, max_values=1, options=opts[:25], row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        old = self.view
+        val = self.values[0]
+        if val == "home":
+            embed, pages = _build_help_home_embed(), None
+        else:
+            pages = _build_cat_pages(val)
+            embed = pages[0]
+        new = HelpView(old.author_id, pages, 0, val)
+        new.message = interaction.message
+        old.stop()
+        await interaction.response.edit_message(embed=embed, view=new)
 
 
 class HelpView(discord.ui.View):
-    def __init__(self, pages, page=0, home_embed=None):
-        super().__init__(timeout=120)
-        self.pages, self.page, self.home_embed = pages, page, home_embed
-        self._update_buttons()
+    def __init__(self, author_id, pages=None, page=0, current="home"):
+        super().__init__(timeout=180)
+        self.author_id, self.pages, self.page, self.message = author_id, pages, page, None
+        self.add_item(HelpSelect(current))
+        if pages and len(pages) > 1:
+            self.prev = discord.ui.Button(label="Précédent", style=discord.ButtonStyle.secondary, row=1)
+            self.next = discord.ui.Button(label="Suivant", style=discord.ButtonStyle.primary, row=1)
+            self.prev.callback, self.next.callback = self._prev, self._next
+            self.add_item(self.prev)
+            self.add_item(self.next)
+            self._sync()
 
-    def _update_buttons(self):
-        self.children[0].disabled = (self.page == 0)
-        self.children[1].disabled = (self.page >= len(self.pages) - 1)
+    def _sync(self):
+        self.prev.disabled = (self.page <= 0)
+        self.next.disabled = (self.page >= len(self.pages) - 1)
 
-    @discord.ui.button(label="Précédent", style=discord.ButtonStyle.secondary)
-    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _prev(self, interaction: discord.Interaction):
         self.page = max(0, self.page - 1)
-        self._update_buttons()
+        self._sync()
         await interaction.response.edit_message(embed=self.pages[self.page], view=self)
 
-    @discord.ui.button(label="Suivant", style=discord.ButtonStyle.primary)
-    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _next(self, interaction: discord.Interaction):
         self.page = min(len(self.pages) - 1, self.page + 1)
-        self._update_buttons()
+        self._sync()
         await interaction.response.edit_message(embed=self.pages[self.page], view=self)
 
-    @discord.ui.button(label="Accueil", style=discord.ButtonStyle.secondary, emoji="🏠")
-    async def home_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(embed=_build_help_home_embed(), view=HomeView())
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Ce menu n'est pas le tien — fais `+help` toi-même.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try: await self.message.edit(view=self)
+            except Exception: pass
 
 
-class HomeView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=120)
-
-    @discord.ui.button(label="Accueil", style=discord.ButtonStyle.secondary, emoji="🏠", disabled=True)
-    async def home_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pass
+async def _send_help(ctx, embed, view):
+    view.message = await ctx.send(embed=embed, view=view)
 
 
 @bot.command(name="help")
-async def cmd_help(ctx, section: str = None):
-    if section and section.lower() in HELP_CATEGORIES:
-        pages = _build_helpall_cat_pages(section.lower())
-        await ctx.send(embed=pages[0], view=HelpView(pages, 0, _build_help_home_embed())); return
-    await ctx.send(embed=_build_help_home_embed(), view=HomeView())
+async def cmd_help(ctx, *, query: str = None):
+    if not query:
+        await _send_help(ctx, _build_help_home_embed(), HelpView(ctx.author.id)); return
+    q = query.strip().lower().lstrip("+")
+    if q in ("all", "tout", "full"):
+        pages = _build_all_pages()
+        await _send_help(ctx, pages[0], HelpView(ctx.author.id, pages, 0, "home")); return
+    if q in HELP_CATEGORIES:
+        pages = _build_cat_pages(q)
+        await _send_help(ctx, pages[0], HelpView(ctx.author.id, pages, 0, q)); return
+    found = _find_cmd(q)
+    if found:
+        key, cat, usage, desc, names = found
+        e = discord.Embed(title=f"Help - {names[0]}", color=C["info"])
+        e.add_field(name="Usage", value=f"`{usage}`", inline=False)
+        e.add_field(name="Description", value=desc or "—", inline=False)
+        e.add_field(name="Catégorie", value=f"{cat['emoji']} {cat['label']} (`+help {key}`)", inline=False)
+        if len(names) > 1:
+            e.add_field(name="Alias", value=" · ".join(f"`{n}`" for n in names[1:]), inline=False)
+        e.set_footer(text="✦ meanings · <> obligatoire · [] optionnel")
+        await ctx.send(embed=e); return
+    pool = list(HELP_CATEGORIES) + [n.lstrip("+") for c in HELP_CATEGORIES.values() for n in _chip_names(c)]
+    close = difflib.get_close_matches(q, pool, n=5, cutoff=0.6)
+    hint = ("\nPeut-être : " + " · ".join(f"`{x}`" for x in close)) if close else ""
+    await ctx.send(embed=make_embed("❌  Commande introuvable",
+        f"> Aucune commande ou catégorie nommée `{q}`.{hint}\n> `+help` pour l'accueil.", C["error"]))
 
 
 @bot.command(name="helpall")
 async def cmd_helpall(ctx, section: str = None, page: int = 1):
     if section and section.lower() in HELP_CATEGORIES:
-        pages = _build_helpall_cat_pages(section.lower())
+        pages = _build_cat_pages(section.lower())
         pg = max(0, min(page - 1, len(pages) - 1))
-        await ctx.send(embed=pages[pg], view=HelpView(pages, pg, _build_help_home_embed())); return
-    pages = _build_helpall_pages()
-    await ctx.send(embed=pages[0], view=HelpView(pages, 0, _build_help_home_embed()))
+        await _send_help(ctx, pages[pg], HelpView(ctx.author.id, pages, pg, section.lower())); return
+    pages = _build_all_pages()
+    pg = max(0, min(page - 1, len(pages) - 1))
+    await _send_help(ctx, pages[pg], HelpView(ctx.author.id, pages, pg, "home"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
