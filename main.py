@@ -1519,6 +1519,11 @@ for _cmd_name, _cl, _mode, _flag, _label, _col in _COMBO_CMDS:
 #  Usage : +comboXfull [nombre] | +comboXfull reset
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Constantes de caractères (doivent être définies AVANT _CS) ───────────────
+_CHARS_ALPHA  = list("abcdefghijklmnopqrstuvwxyz")
+_CHARS_DIGIT  = list("0123456789")
+_CHARS_ALNUM  = _CHARS_ALPHA + _CHARS_DIGIT  # 36 chars → 36^4 = 1 679 616
+
 # ── Charsets par mode ─────────────────────────────────────────────────────────
 _CS = {
     "alnum":      _CHARS_ALPHA + _CHARS_DIGIT,   # 36
@@ -1812,9 +1817,6 @@ for _name, _size, _flag, _label, _color, _speed in [
 #  🔢 SCANS 4 CHARS — lettres + chiffres (a-z, 0-9) → 36^4 = 1 679 616 combos
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_CHARS_ALPHA  = list("abcdefghijklmnopqrstuvwxyz")
-_CHARS_DIGIT  = list("0123456789")
-_CHARS_ALNUM  = _CHARS_ALPHA + _CHARS_DIGIT  # 36 chars → 36^4 = 1 679 616
 
 def _gen_4c_random(n: int, charset=None) -> list:
     """Génère n combinaisons 4-chars aléatoires sans répétition (charset=alnum par défaut)."""
