@@ -65,6 +65,7 @@ WATCH_PAUSED = set()
 CONFIG       = {"max_results": MAX_RESULTS, "check_delay": CHECK_DELAY, "parallel": PARALLEL}
 TOTAL_CMDS   = 0
 RATE         = {"until": 0.0}   # fin du blocage 429 sur la route pseudo
+CHECKED_CACHE: set = set()      # pseudos déjà vérifiés — jamais re-envoyés à l'API
 
 # ── COULEURS ──────────────────────────────────────────────────────────────────
 C = {
@@ -605,6 +606,300 @@ print(f"[*] Prêt — FR:{len(ALL_FR):,} EN:{len(ALL_EN):,} Villes:{len(ALL_CITI
 if not _loaded_fr:
     print("[WARN] Dico FR non chargé : seuls 41 mots de secours sont utilisés.")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  🇫🇷  MOTEUR DE CONJUGAISON FRANÇAIS
+#  Génère programmatiquement toutes les formes conjuguées des verbes du dico FR.
+#  Couvre : présent, imparfait, futur simple, passé simple, conditionnel présent,
+#           subjonctif présent, impératif, participes présent et passé.
+#  Résultat injecté dans ALL_FR → disponible dans tous les scans.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _conjugate_fr(infinitif: str) -> list[str]:
+    """
+    Retourne toutes les formes conjuguées déduites de l'infinitif.
+    Couvre les 3 groupes + irréguliers fréquents.
+    Sortie : liste de formes ASCII minuscules valides pour Discord.
+    """
+    inf = strip_accents(infinitif.strip().lower())
+    if not re.match(r'^[a-z]{4,20}$', inf):
+        return []
+    forms = set()
+
+    # ── Groupe 1 : -er ────────────────────────────────────────────────────────
+    if inf.endswith("er") and not inf.endswith("aller"):
+        rad = inf[:-2]
+        # Particularités orthographiques
+        rad_nous = rad
+        rad_imp  = rad
+        if rad.endswith("g"):   rad_nous = rad + "e"        # nager → nageons
+        if rad.endswith("c"):   rad_nous = rad[:-1] + "c"   # placer → plaçons → normalisé
+        if rad.endswith("el") or rad.endswith("et"):
+            rad_imp = rad + rad[-1]                          # appeler → appell-
+        if rad.endswith("e") and len(rad) > 2:
+            rad_imp = rad                                    # peser → pès- (simplification)
+
+        # Présent
+        for s in ("e","es","e","ons","ez","ent"):
+            forms.add(rad + s) if s in ("ons","ez") else forms.add(rad_imp + s)
+        # Imparfait
+        for s in ("ais","ais","ait","ions","iez","aient"):
+            forms.add(rad_nous + s) if s in ("ions","iez") else forms.add(rad + s)
+        # Futur
+        for s in ("erai","eras","era","erons","erez","eront"):
+            forms.add(rad + s)
+        # Passé simple
+        for s in ("ai","as","a","ames","ates","erent"):
+            forms.add(rad + s)
+        # Conditionnel
+        for s in ("erais","erais","erait","erions","eriez","eraient"):
+            forms.add(rad + s)
+        # Subjonctif présent
+        for s in ("e","es","e","ions","iez","ent"):
+            forms.add(rad_nous + s) if s in ("ions","iez") else forms.add(rad_imp + s)
+        # Impératif
+        forms.update([rad_imp + "e", rad_nous + "ons", rad + "ez"])
+        # Participes
+        forms.add(rad + "ant")   # présent
+        forms.add(rad + "e")     # passé m.s.
+        forms.add(rad + "es")    # passé f.s.
+        forms.add(rad + "es")    # passé m.pl.
+
+    # ── Groupe 2 : -ir (finissant) ────────────────────────────────────────────
+    elif inf.endswith("ir") and len(inf) > 4:
+        rad = inf[:-2]
+        rad2 = rad + "iss"       # radical long (finir → finiss-)
+        # Présent
+        forms.update([rad+"is", rad+"is", rad+"it", rad2+"ons", rad2+"ez", rad2+"ent"])
+        # Imparfait
+        for s in ("ais","ais","ait","ions","iez","aient"):
+            forms.add(rad2 + s)
+        # Futur
+        for s in ("irai","iras","ira","irons","irez","iront"):
+            forms.add(rad + s)
+        # Passé simple
+        for s in ("is","is","it","imes","ites","irent"):
+            forms.add(rad + s)
+        # Conditionnel
+        for s in ("irais","irais","irait","irions","iriez","iraient"):
+            forms.add(rad + s)
+        # Subjonctif
+        for s in ("isse","isses","isse","issions","issiez","issent"):
+            forms.add(rad + s)
+        # Participes
+        forms.add(rad + "issant")
+        forms.add(rad + "i")
+        forms.add(rad + "ie")
+        forms.add(rad + "is")
+
+    # ── Groupe 3 : -re ────────────────────────────────────────────────────────
+    elif inf.endswith("re") and len(inf) > 4:
+        rad   = inf[:-2]   # prendr
+        rad_e = inf[:-1]   # prendre → prendre (garde le e)
+        # Futur/conditionnel : inf sans -e final → prendre → prendr + ai etc.
+        # (l'infinitif -re perd son e : prendre → je prendrai, pas prendrerai)
+        rad_fut = inf[:-1] if inf[-2] == 'r' else rad   # prendr-e → prendr
+        # Présent
+        forms.update([rad+"s", rad+"", rad+"ons", rad+"ez", rad+"ent"])
+        # Imparfait
+        for s in ("ais","ait","ions","iez","aient"):
+            forms.add(rad + s)
+        # Futur
+        for s in ("ai","as","a","ons","ez","ont"):
+            forms.add(rad_fut + s)
+        # Passé simple
+        for s in ("is","it","imes","ites","irent"):
+            forms.add(rad + s)
+        # Conditionnel
+        for s in ("ais","ait","ions","iez","aient"):
+            forms.add(rad_fut + s)
+        # Subjonctif
+        for s in ("e","es","ions","iez","ent"):
+            forms.add(rad + s)
+        # Participes
+        forms.add(rad + "ant")
+        forms.add(rad + "u")
+        forms.add(rad + "ue")
+        forms.add(rad + "us")
+
+    # ── Irréguliers fréquents ─────────────────────────────────────────────────
+    _IRREG: dict[str, list[str]] = {
+        "etre":   ["suis","es","est","sommes","etes","sont","etais","etait","etions",
+                   "etaient","serai","seras","sera","serons","serez","seront",
+                   "serais","serait","serions","seraient","sois","soit","soyons","soyez",
+                   "soient","etant","ete"],
+        "avoir":  ["ai","as","avons","avez","ont","avais","avait","avions",
+                   "avaient","aurai","auras","aura","aurons","aurez","auront",
+                   "aurais","aurait","aurions","auraient","aie","ait","ayons","ayez",
+                   "aient","ayant","eu"],
+        "aller":  ["vais","vas","allons","allez","vont","allais","allait","allions",
+                   "allaient","irai","iras","ira","irons","irez","iront",
+                   "irais","irait","irions","iraient","aille","ailles","aillent",
+                   "allant","alle"],
+        "faire":  ["fais","faisons","faites","font","faisais","faisait","faisions",
+                   "faisaient","ferai","feras","fera","ferons","ferez","feront",
+                   "ferais","ferait","ferions","feraient","fasse","fasses","fassiez",
+                   "fassions","fassent","faisant","fait","faite","faits","faites"],
+        "venir":  ["viens","venons","venez","viennent","venais","venait","venions",
+                   "viendrai","viendras","viendra","viendrons","viendrez","viendront",
+                   "viendrais","viendrait","viendrions","viendraient",
+                   "vienne","viennes","viennent","venant","venu","venue","venus"],
+        "pouvoir":["peux","peut","pouvons","pouvez","peuvent","pouvais","pouvait",
+                   "pouvions","pouvaient","pourrai","pourras","pourra","pourrons",
+                   "pourrez","pourront","pourrais","pourrait","pourrions",
+                   "pourraient","puisse","puisses","puissent","pouvant","pu"],
+        "vouloir":["veux","veut","voulons","voulez","veulent","voulais","voulait",
+                   "voulions","voulaient","voudrai","voudras","voudra","voudrons",
+                   "voudrez","voudront","voudrais","voudrait","voudrions","voudraient",
+                   "veuille","veuilles","veuillent","voulant","voulu","voulue"],
+        "savoir": ["sais","savons","savez","savent","savais","savait","savions",
+                   "savaient","saurai","sauras","saura","saurons","saurez","sauront",
+                   "saurais","saurait","saurions","sauraient","sache","saches","sachent",
+                   "sachons","sachez","sachant","su","sue","sus"],
+        "prendre":["prends","prenons","prenez","prennent","prenais","prenait",
+                   "prenions","prenaient","prendrai","prendras","prendra","prendrons",
+                   "prendrez","prendront","prendrais","prendrait","prendrions",
+                   "prendraient","prenne","prennes","prennent","prenant","pris","prise"],
+        "mettre": ["mets","mettons","mettez","mettent","mettais","mettait","mettions",
+                   "mettaient","mettrai","mettras","mettra","mettrons","mettrez",
+                   "mettront","mettrais","mettrait","mettrions","mettraient",
+                   "mette","mettes","mettent","mettant","mis","mise","mis"],
+        "dire":   ["dis","disons","dites","disent","disais","disait","disions",
+                   "disaient","dirai","diras","dira","dirons","direz","diront",
+                   "dirais","dirait","dirions","diraient","dise","dises","disent",
+                   "disant","dit","dite","dits"],
+        "voir":   ["vois","voyons","voyez","voient","voyais","voyait","voyions",
+                   "voyaient","verrai","verras","verra","verrons","verrez","verront",
+                   "verrais","verrait","verrions","verraient","voie","voies","voient",
+                   "voyant","vu","vue","vus"],
+        "partir": ["pars","partons","partez","partent","partais","partait","partions",
+                   "partaient","partirai","partiras","partira","partirons","partirez",
+                   "partiront","partirais","partirait","partirions","partiraient",
+                   "parte","partes","partent","partant","parti","partie","partis"],
+        "sortir": ["sors","sortons","sortez","sortent","sortais","sortait","sortions",
+                   "sortaient","sortirai","sortiras","sortira","sortirons","sortirez",
+                   "sortiront","sortirais","sortirait","sortirions","sortiraient",
+                   "sorte","sortes","sortent","sortant","sorti","sortie","sortis"],
+        "croire": ["crois","croyons","croyez","croient","croyais","croyait","croyions",
+                   "croyaient","croirai","croiras","croira","croirons","croirez","croiront",
+                   "croirais","croirait","croirions","croiraient","croie","croies","croient",
+                   "croyant","cru","crue","crus"],
+        "devoir": ["dois","devons","devez","doivent","devais","devait","devions",
+                   "devaient","devrai","devras","devra","devrons","devrez","devront",
+                   "devrais","devrait","devrions","devraient","doive","doives","doivent",
+                   "devant","du","due","dus"],
+        "tenir":  ["tiens","tenons","tenez","tiennent","tenais","tenait","tenions",
+                   "tenaient","tiendrai","tiendras","tiendra","tiendrons","tiendrez",
+                   "tiendront","tiendrais","tiendrait","tiendrions","tiendraient",
+                   "tienne","tiennes","tiennent","tenant","tenu","tenue","tenus"],
+        "vivre":  ["vis","vivons","vivez","vivent","vivais","vivait","vivions",
+                   "vivaient","vivrai","vivras","vivra","vivrons","vivrez","vivront",
+                   "vivrais","vivrait","vivrions","vivraient","vive","vives","vivent",
+                   "vivant","vecu","vecue","vecus"],
+    }
+    if inf in _IRREG:
+        forms.update(_IRREG[inf])
+        return [strip_accents(f) for f in forms if re.match(r'^[a-z]{2,20}$', strip_accents(f))]
+
+    # Nettoyage final — retire accents résiduels, garde seulement a-z 2-20 chars
+    cleaned = []
+    for f in forms:
+        fa = strip_accents(f)
+        if re.match(r'^[a-z]{2,20}$', fa):
+            cleaned.append(fa)
+    return cleaned
+
+
+def _build_conjugation_corpus() -> list[str]:
+    """
+    Applique _conjugate_fr sur tous les verbes connus (ALL_FR + liste hard-codée
+    de ~300 verbes courants) et retourne un corpus dédupliqué.
+    Lancé une seule fois au boot dans un thread.
+    """
+    # Verbes courants garantis même si le dico FR ne charge pas
+    COMMON_VERBS = [
+        "aimer","parler","chanter","danser","jouer","travailler","marcher","regarder",
+        "ecouter","manger","boire","dormir","courir","sauter","voler","nager","plonger",
+        "grimper","tomber","rester","partir","arriver","entrer","sortir","monter","descendre",
+        "ouvrir","fermer","commencer","finir","terminer","continuer","arreter","changer",
+        "penser","croire","savoir","connaitre","comprendre","apprendre","lire","ecrire",
+        "dessiner","peindre","construire","detruire","vendre","acheter","payer","donner",
+        "recevoir","envoyer","appeler","repondre","demander","expliquer","montrer","trouver",
+        "chercher","perdre","gagner","joindre","rejoindre","suivre","conduire","rouler",
+        "voler","nager","plonger","grimper","ramper","glisser","sauter","courir","marcher",
+        "dormir","manger","boire","respirer","sentir","toucher","entendre","voir","regarder",
+        "observer","noter","mesurer","peser","compter","calculer","resoudre","choisir",
+        "decider","accepter","refuser","oublier","rappeler","souvenir","esperer","craindre",
+        "aider","proteger","defendre","attaquer","fuir","cacher","montrer","offrir","vouloir",
+        "pouvoir","devoir","falloir","valoir","pleuvoir","neiger","geler","fondre","bruler",
+        "exploser","trembler","crier","rire","pleurer","sourire","applaudir","frapper",
+        "couper","casser","reparer","nettoyer","laver","secher","plier","etendre","accrocher",
+        "ranger","trier","organiser","planifier","preparer","cuisiner","servir","gouter",
+        "voyager","visiter","explorer","decouvrir","inventer","creer","imaginer","rever",
+        "mediter","prier","choisir","preferer","adorer","detester","respecter","admirer",
+        "critiquer","evaluer","noter","corriger","ameliorer","developper","former","enseigner",
+        "etudier","reviser","memoriser","oublier","rappeler","informer","communiquer","partager",
+        "collaborer","negocier","convaincre","persuader","mentir","tromper","voler","rendre",
+        "emprunter","preter","echanger","comparer","distinguer","identifier","classer","trier",
+        "simplifier","completer","remplir","vider","ouvrir","fermer","verrouiller","deverrouiller",
+        "allumer","eteindre","brancher","debrancher","installer","desinstaller","configurer",
+        "programmer","coder","tester","verifier","analyser","comprendre","expliquer","resumer",
+        "presenter","afficher","imprimer","sauvegarder","charger","telecharger","envoyer",
+        "recevoir","stocker","archiver","supprimer","restaurer","copier","coller","couper",
+        "modifier","editer","formater","publier","diffuser","transmettre","connecter","deconnecter",
+        "synchroniser","mettre","prendre","laisser","apporter","emporter","ramener","rapporter",
+        "pousser","tirer","soulever","porter","deposer","poser","placer","disposer","arranger",
+        "assembler","demonter","remonter","ajuster","calibrer","regler","controler","surveiller",
+        "proteger","securiser","crypter","decrypter","autoriser","interdire","valider","annuler",
+        "confirmer","refuser","accepter","approuver","rejeter","signaler","alerter","prevenir",
+        "avertir","notifier","informer","publier","cacher","reveler","exposer","proteger",
+        "maintenir","conserver","preserverez","restaurer","recuperer","reparer","corriger",
+        "optimiser","accelerer","ralentir","stopper","reprendre","relancer","redemarrer",
+        "nourrir","grandir","vieillir","rajeunir","guerir","soigner","blesser","sauver",
+        "mourir","naitre","exister","disparaitre","apparaitre","revenir","repartir","rentrer",
+    ]
+
+    candidate_verbs: set[str] = set()
+
+    # Verbes déduits du dico FR (ceux qui finissent en -er, -ir, -re)
+    for w in ALL_FR:
+        if w.endswith(("er","ir","re")) and 4 <= len(w) <= 20:
+            candidate_verbs.add(w)
+
+    # Merge avec la liste hard-codée
+    for v in COMMON_VERBS:
+        candidate_verbs.add(strip_accents(v))
+
+    corpus: set[str] = set()
+    for verb in candidate_verbs:
+        for form in _conjugate_fr(verb):
+            if is_valid(form):
+                corpus.add(form)
+
+    print(f"[*] Conjugaisons FR : {len(candidate_verbs):,} verbes → {len(corpus):,} formes")
+    return list(corpus)
+
+
+# Lance la construction du corpus conjugaison en parallèle au boot
+import threading as _threading
+_conj_ready   = _threading.Event()
+_conj_corpus: list[str] = []
+
+def _boot_conjugations():
+    global _conj_corpus
+    _conj_corpus = _build_conjugation_corpus()
+    # Injecte dans ALL_FR directement
+    _before = len(ALL_FR)
+    _existing = set(ALL_FR)
+    for w in _conj_corpus:
+        if w not in _existing:
+            ALL_FR.append(w)
+            _existing.add(w)
+    print(f"[*] ALL_FR étendu : {_before:,} → {len(ALL_FR):,} (+{len(ALL_FR)-_before:,} conjugaisons)")
+    _conj_ready.set()
+
+_threading.Thread(target=_boot_conjugations, daemon=True).start()
+
 # ── VANITY BLACKLIST ──────────────────────────────────────────────────────────
 VANITY_BLACKLIST = set([
     "discord","discordapp","discordnitro","nitro","nitrogift","gift","clyde","wumpus",
@@ -661,7 +956,16 @@ def to_underscore(word):
     return word
 
 
-# ── BUILD POOL (corrigé : plus de set() reconstruit à chaque itération) ───────
+# ── BUILD POOL — pool élargi (paires + triplets + quadruplets + suffixes) ──────
+#
+#  Espace candidats théorique :
+#    paires    : C(50k,2) ≈ 1.25 milliard de combinaisons mot+mot
+#    triplets  : beaucoup plus — on pioche dans random.sample donc praticable
+#    suffixes  : mots + {0-9, 00-99, 000-999, année, _xyz} → ×1000 par mot
+#
+#  build_pool ne les génère pas tous (trop long), mais un n élevé puise
+#  dedans très largement, et _gen_combo / +lenNfull couvrent l'espace exhaustif.
+# ──────────────────────────────────────────────────────────────────────────────
 def build_pool(word_list, n=100, min_len=3, max_len=16,
                aesthetic=False, leet=False, reverse=False, underscore=False,
                preserve_order=False):
@@ -670,7 +974,7 @@ def build_pool(word_list, n=100, min_len=3, max_len=16,
         return []
     if not preserve_order:
         random.shuffle(solo)
-    pool = set(solo[:n])
+    pool: set[str] = set(solo[:n])
 
     if aesthetic:
         for w in solo[:n // 2]:
@@ -689,21 +993,74 @@ def build_pool(word_list, n=100, min_len=3, max_len=16,
             v = to_underscore(w)
             if is_valid(v): pool.add(v)
 
-    solo_set = set(solo)
+    solo_set   = set(solo)
     solo_valid = [p for p in pool if '_' not in p and p in solo_set]
-    valid_set = set(solo_valid)
-    combos = []
-    if len(solo_valid) < n:
-        pairs_src = random.sample(solo, min(120, len(solo)))
-        for a, b in itertools.combinations(pairs_src, 2):
-            if len(combos) >= n * 2: break
-            if 5 <= len(a) + len(b) <= max_len:
-                combos.append(f"{a}{b}")
-                combos.append(f"{a}_{b}")
-        random.shuffle(combos)
+    valid_set  = set(solo_valid)
+
+    # ── Paires (a+b) et paires inversées (b+a) ────────────────────────────────
+    combos: list[str] = []
+    src_pairs = random.sample(solo, min(600, len(solo)))
+    for a, b in itertools.combinations(src_pairs, 2):
+        if len(combos) >= n * 6: break
+        ab = a + b
+        ba = b + a
+        if 5 <= len(ab) <= max_len:
+            combos.append(ab)
+            combos.append(a + "_" + b)
+        if 5 <= len(ba) <= max_len:
+            combos.append(ba)
+
+    # ── Triplets (a+b+c) ──────────────────────────────────────────────────────
+    # Mots courts (3-5 chars) → les triplets restent sous max_len facilement
+    shorts = [w for w in solo if 3 <= len(w) <= 5]
+    random.shuffle(shorts)
+    src_tri = shorts[:300]
+    for i in range(0, len(src_tri) - 2, 1):
+        if len(combos) >= n * 10: break
+        a, b, c = src_tri[i], src_tri[i+1], src_tri[i+2]
+        abc = a + b + c
+        if 6 <= len(abc) <= max_len and abc not in pool:
+            combos.append(abc)
+
+    # ── Suffixes numériques : mot + 1-3 chiffres ─────────────────────────────
+    #    génère des milliers de variantes uniques par run
+    num_src = random.sample(solo, min(400, len(solo)))
+    for w in num_src:
+        if len(combos) >= n * 15: break
+        for suffix in (
+            str(random.randint(0, 9)),
+            str(random.randint(10, 99)),
+            str(random.randint(100, 999)),
+            str(random.randint(2000, 2025)),
+        ):
+            v = w + suffix
+            if is_valid(v):
+                combos.append(v)
+        # préfixe numérique aussi
+        for prefix in (str(random.randint(0, 9)), str(random.randint(10, 99))):
+            v = prefix + w
+            if is_valid(v):
+                combos.append(v)
+
+    # ── Quadruplets ultra-courts (2+2+2+2 → 8 chars max) ─────────────────────
+    micro = [w for w in solo if 2 <= len(w) <= 3]
+    random.shuffle(micro)
+    for i in range(0, min(len(micro) - 3, 500), 4):
+        if len(combos) >= n * 20: break
+        quad = micro[i] + micro[i+1] + micro[i+2] + micro[i+3]
+        if 6 <= len(quad) <= max_len and is_valid(quad):
+            combos.append(quad)
+
+    random.shuffle(combos)
+    deduped_combos = []
+    seen_combos: set[str] = set(pool)
+    for c in combos:
+        if c not in seen_combos and is_valid(c):
+            deduped_combos.append(c)
+            seen_combos.add(c)
 
     extras = [p for p in pool if p not in valid_set and is_valid(p)]
-    result = solo_valid + extras + [c for c in combos if is_valid(c)]
+    result = solo_valid + extras + deduped_combos
     return result[:n]
 
 
@@ -816,6 +1173,19 @@ async def _scan_engine(candidates, max_results, msg, flag, label, color,
         except Exception: pass
         return [], 0
 
+    # ── Dedup : retire les candidats déjà vérifiés dans cette session ─────────
+    # Cache vanity séparé du cache pseudo (un pseudo pris ≠ vanity prise)
+    cache_key = lambda t: f"v:{t}" if is_vanity else t
+    seen_this_run: set = set()
+    deduped = []
+    for t in candidates:
+        k = cache_key(t)
+        if k not in CHECKED_CACHE and t not in seen_this_run:
+            deduped.append(t)
+            seen_this_run.add(t)
+    candidates = deduped
+    # ──────────────────────────────────────────────────────────────────────────
+
     found = []
     checked = 0
     invalid = False
@@ -838,6 +1208,8 @@ async def _scan_engine(candidates, max_results, msg, flag, label, color,
                 limited = True
                 return
             checked += 1
+            # Mémorise le résultat — pris ou libre, on ne re-vérifie pas
+            CHECKED_CACHE.add(cache_key(target))
             if result is True:
                 found.append(target)
                 STATS["found"] += 1
@@ -1124,6 +1496,213 @@ for _cl in range(4, 9):   # 4 → 8 chars
 
 for _cmd_name, _cl, _mode, _flag, _label, _col in _COMBO_CMDS:
     bot.command(name=_cmd_name)(_make_combo_cmd(_cl, _mode, _flag, _label, _col))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  🗺️  COMBO SWEEP EXHAUSTIF — même logique que +4cfull / +5cfull
+#
+#  Charsets par mode (identiques à _gen_combo) :
+#    alnum      → a-z + 0-9  (36 chars)
+#    alpha      → a-z         (26 chars)
+#    digit      → 0-9         (10 chars)
+#    letter_num → a-z puis 0-9 (sweep sur moitiés fixes)
+#    num_letter → 0-9 puis a-z
+#
+#  Commandes générées pour len 4 → 8 :
+#    +combo4full  / +combo4reset   (alnum)
+#    +combo4lful  / +combo4lreset  (alpha)
+#    +combo4dful  / +combo4dreset  (digit)
+#    +combo4lnful / +combo4lnreset (letter_num)
+#    +combo4nlful / +combo4nlreset (num_letter)
+#    … idem pour 5, 6, 7, 8
+#
+#  Usage : +comboXfull [nombre] | +comboXfull reset
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Charsets par mode ─────────────────────────────────────────────────────────
+_CS = {
+    "alnum":      _CHARS_ALPHA + _CHARS_DIGIT,   # 36
+    "alpha":      _CHARS_ALPHA,                   # 26
+    "digit":      _CHARS_DIGIT,                   # 10
+    # letter_num et num_letter : sweep sur charset complet alnum,
+    # on filtre à la génération pour garder la structure L…D ou D…L
+    "letter_num": _CHARS_ALPHA + _CHARS_DIGIT,   # 36 — filtré post-génération
+    "num_letter": _CHARS_ALPHA + _CHARS_DIGIT,   # 36 — filtré post-génération
+}
+
+# ── États d'offset : un dict par (length, mode) ───────────────────────────────
+_COMBO_SWEEP_STATE: dict = {}   # clé = (length, mode) → {"offset": int, "total": int}
+
+def _combo_sweep_total(length: int, mode: str) -> int:
+    """Nombre brut de combos pour ce (length, mode) avant filtrage."""
+    return len(_CS[mode]) ** length
+
+for _cl in range(4, 9):
+    for _mode in ("alnum", "alpha", "digit", "letter_num", "num_letter"):
+        _COMBO_SWEEP_STATE[(_cl, _mode)] = {
+            "offset": 0,
+            "total":  _combo_sweep_total(_cl, _mode),
+        }
+
+
+def _combo_valid_chunk(offset: int, size: int, length: int, mode: str) -> tuple:
+    """
+    Génère un chunk déterministe de combos pour (length, mode).
+    Pour letter_num  : moitié gauche = lettres, moitié droite = chiffres.
+    Pour num_letter  : moitié gauche = chiffres, moitié droite = lettres.
+    Retourne (words, raw_indices) — même contrat que _gen_valid_chunk.
+    """
+    cs   = _CS[mode]
+    base = len(cs)
+    cap  = base ** length
+    words, idxs = [], []
+
+    for i in range(offset, min(offset + size, cap)):
+        # décode l'index → combo sur le charset complet
+        tmp, combo = i, []
+        for _ in range(length):
+            combo.append(cs[tmp % base])
+            tmp //= base
+        w = "".join(reversed(combo))
+
+        # filtre ".." (ne concerne que alnum qui inclut parfois "_." — ici non,
+        # mais on garde la garde pour cohérence)
+        if ".." in w:
+            continue
+
+        # filtre structurel pour letter_num / num_letter
+        if mode == "letter_num":
+            nl = (length + 1) // 2          # nb de chars lettres (côté gauche)
+            if not (all(c in _CHARS_ALPHA for c in w[:nl]) and
+                    all(c in _CHARS_DIGIT for c in w[nl:])):
+                continue
+        elif mode == "num_letter":
+            nd = length // 2                # nb de chars chiffres (côté gauche)
+            if not (all(c in _CHARS_DIGIT for c in w[:nd]) and
+                    all(c in _CHARS_ALPHA for c in w[nd:])):
+                continue
+
+        if is_valid(w):
+            words.append(w)
+            idxs.append(i)
+
+    return words, idxs
+
+
+async def _run_combo_sweep(ctx, length: int, mode: str,
+                           cmd_name: str, flag: str, label: str, color_key: str,
+                           arg=None):
+    state = _COMBO_SWEEP_STATE[(length, mode)]
+    total = state["total"]
+
+    # reset
+    if arg and arg.lower() == "reset":
+        state["offset"] = 0
+        await ctx.send(embed=make_embed(
+            f"✅  {label} reset",
+            f"> Sweep remis à zéro. `+{cmd_name}` reprend depuis le début.",
+            C["check"]))
+        return
+
+    # parse limit
+    try:
+        limit = int(arg) if arg else CONFIG["max_results"]
+    except ValueError:
+        await ctx.send(embed=make_embed("⚠️  Argument invalide",
+            f"> Utilise `+{cmd_name} [nombre]` ou `+{cmd_name} reset`.", C["warn"]))
+        return
+
+    if not USER_TOKEN:
+        await ctx.send(embed=token_missing_embed()); return
+    limit = max(1, min(limit, 30))
+
+    offset = state["offset"]
+    if offset >= total:
+        await ctx.send(embed=make_embed("✅  Sweep terminé",
+            f"> Toutes les `{total:,}` combos `{label}` ont été parcourues.\n"
+            f"> `+{cmd_name} reset` pour recommencer.", C["check"]))
+        return
+
+    candidates, idxs = await asyncio.to_thread(
+        _combo_valid_chunk, offset, SWEEP_CHUNK, length, mode)
+
+    if not candidates:
+        state["offset"] = min(total, offset + SWEEP_CHUNK)
+        await ctx.send(embed=make_embed("⏭️  Tranche ignorée",
+            "> Aucune combo valide dans cette tranche, relance.", C["warn"]))
+        return
+
+    STATS["scans"] += 1
+    pct = offset / total * 100
+    msg = await ctx.send(embed=make_embed(
+        description=f"```\n{flag}  {label} SWEEP — {offset:,}/{total:,} ({pct:.4f}%)...\n```",
+        footer=f"{cmd_name} sweep"))
+
+    found, checked = await _scan_engine(
+        candidates, limit, msg, flag, f"{label} SWEEP", C[color_key],
+        check_available, False, ctx)
+
+    if not found and checked == 0:
+        remaining = max(0, int(RATE["until"] - time.time()))
+        desc = (f"> Rate limit — réessaie dans ~`{remaining}s`." if remaining > 0
+                else "> Token invalide ou expiré.")
+        await msg.edit(embed=discord.Embed(
+            title="❌  Token refusé ou limite Discord", description=desc, color=C["error"]))
+        return
+
+    # avance l'offset exactement sur ce qui a été vérifié
+    state["offset"] = (idxs[min(checked, len(idxs)) - 1] + 1) if checked else offset
+    new_pct = state["offset"] / total * 100
+
+    e = result_embed(found, checked, flag, f"{label} SWEEP", C[color_key])
+    e.set_footer(text=(f"meanings · sweep {state['offset']:,}/{total:,} "
+                       f"({new_pct:.4f}%) — +{cmd_name} pour continuer"))
+    await msg.edit(embed=e)
+
+
+def _make_combo_sweep_cmds(length: int, mode: str,
+                            cmd_base: str, flag: str, label: str, color_key: str):
+    """
+    Enregistre deux commandes :
+      +{cmd_base}ful   → sweep + accept [nombre] et 'reset'
+      +{cmd_base}reset → raccourci reset
+    (on utilise 'ful' au lieu de 'full' pour éviter conflit avec +4cfull existant)
+    """
+    full_name  = f"{cmd_base}ful"
+    reset_name = f"{cmd_base}reset"
+
+    async def _full(ctx, arg: str = None):
+        await _run_combo_sweep(ctx, length, mode, full_name, flag, label, color_key, arg)
+
+    async def _reset(ctx):
+        await _run_combo_sweep(ctx, length, mode, full_name, flag, label, color_key, "reset")
+
+    _full.__doc__  = (f"Sweep exhaustif {label} ({length} chars, mode {mode}). "
+                      f"Usage: +{full_name} [nombre] | +{full_name} reset")
+    _reset.__doc__ = f"Reset sweep {label}."
+    bot.command(name=full_name)(_full)
+    bot.command(name=reset_name)(_reset)
+
+
+# ── Tableau des sweeps combo ───────────────────────────────────────────────────
+# (cmd_base, length, mode, flag, label, color)
+_COMBO_SWEEP_TABLE = []
+_MODE_META = {
+    #  mode         flag   suffix  color
+    "alnum":      ("🔀", "",    "og"),
+    "alpha":      ("🔡", "l",   "mix"),
+    "digit":      ("🔢", "d",   "fr"),
+    "letter_num": ("🔣", "ln",  "cyber"),
+    "num_letter": ("🔣", "nl",  "cyber"),
+}
+for _cl in range(4, 9):
+    for _mode, (_flag, _suf, _col) in _MODE_META.items():
+        _cmd_base = f"{_cl}{_suf}"          # ex: 4, 4l, 4d, 4ln, 4nl
+        _label    = f"{_cl}{_suf.upper()}"  # ex: 4, 4L, 4D, 4LN, 4NL
+        _COMBO_SWEEP_TABLE.append((_cl, _mode, _cmd_base, _flag, _label, _col))
+
+for _cl, _mode, _cmd_base, _flag, _label, _col in _COMBO_SWEEP_TABLE:
+    _make_combo_sweep_cmds(_cl, _mode, _cmd_base, _flag, _label, _col)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2682,8 +3261,24 @@ async def cmd_stats(ctx):
     e.add_field(name="👀  Watchlist", value=f"`{len(WATCHLIST):,}`", inline=True)
     e.add_field(name="⏱️  Uptime", value=f"`{h}h {m}m`", inline=True)
     e.add_field(name="📚  Dicos", value=f"`{len(ALL_FR):,} FR · {len(ALL_EN):,} EN · {len(ALL_CITIES):,} villes`", inline=False)
-    e.set_footer(text="meanings · stats")
+    pseudo_cache = sum(1 for k in CHECKED_CACHE if not k.startswith("v:"))
+    vanity_cache = sum(1 for k in CHECKED_CACHE if k.startswith("v:"))
+    e.add_field(name="🗃️  Cache (doublons évités)",
+        value=f"`{pseudo_cache:,} pseudos · {vanity_cache:,} vanités`", inline=False)
+    e.set_footer(text="meanings · stats · +clearcache pour vider le cache")
     await ctx.send(embed=e)
+
+
+@bot.command(name="clearcache")
+async def cmd_clearcache(ctx):
+    """Vide le cache de pseudos/vanités déjà vérifiés. Usage: +clearcache"""
+    before = len(CHECKED_CACHE)
+    CHECKED_CACHE.clear()
+    await ctx.send(embed=discord.Embed(
+        title="🗑️  Cache vidé",
+        description=(f"> `{before:,}` entrées supprimées.\n"
+                     "> Les prochains scans peuvent re-vérifier tous les pseudos."),
+        color=C["check"]))
 
 
 @bot.command(name="botinfo")
