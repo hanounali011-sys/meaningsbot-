@@ -37,9 +37,9 @@ for _fname, _url in _WORDLISTS.items():
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN",  "").strip()
 USER_TOKEN  = os.environ.get("USER_TOKEN", "").strip()
-CHECK_DELAY = 0.3
+CHECK_DELAY = 1.0   # pomelo-attempt est très limité par Discord
 MAX_RESULTS = 15
-PARALLEL    = 5
+PARALLEL    = 2
 PREFIX      = "+"
 START_TIME  = time.time()
 OWNER_ID    = int(os.environ.get("OWNER_ID", "0") or 0)
@@ -1096,7 +1096,7 @@ async def check_available(session, username):
                     retry = float(_j.loads(body).get("retry_after", retry))
                 except Exception:
                     pass
-                retry = min(retry, 60)  # cap à 60s max pour éviter les blocages trop longs
+                retry = min(retry, 600)  # on respecte le vrai Retry-After de Discord (relancer trop tôt aggrave la limite)
                 RATE["until"] = time.time() + retry
                 print(f"[DEBUG] pomelo RATE_LIMITED — cooldown {retry:.1f}s", flush=True)
                 return "RATE_LIMITED"
@@ -1157,7 +1157,7 @@ def token_missing_embed():
 
 
 # ── SCAN ENGINE ───────────────────────────────────────────────────────────────
-async def _scan_engine(candidates, max_results, msg, flag, label, color,
+async def _scan_engine_inner(candidates, max_results, msg, flag, label, color,
                        check_fn, is_vanity=False, ctx=None, speed=None):
     if speed is None:
         speed = CONFIG["check_delay"]
@@ -1167,11 +1167,17 @@ async def _scan_engine(candidates, max_results, msg, flag, label, color,
         return [], 0
     wait = RATE["until"] - time.time()
     if not is_vanity and check_fn == check_available and wait > 0:
+        if wait > MAX_RATE_WAIT:
+            try:
+                await msg.edit(embed=make_embed("⏳  Limite Discord",
+                    f"> Checks de pseudos bloqués encore ~`{int(wait)}s`.\n> Les commandes `vanity` ne sont pas touchées.", C["warn"]))
+            except Exception: pass
+            return [], 0
         try:
             await msg.edit(embed=make_embed("⏳  Limite Discord",
-                f"> Checks de pseudos bloqués encore ~`{int(wait)}s`.\n> Les commandes `vanity` ne sont pas touchées.", C["warn"]))
+                f"> Reprise automatique dans ~`{int(wait)}s`...", C["warn"]))
         except Exception: pass
-        return [], 0
+        await asyncio.sleep(wait + 0.5)
 
     # ── Dedup : retire les candidats déjà vérifiés dans cette session ─────────
     # Cache vanity séparé du cache pseudo (un pseudo pris ≠ vanity prise)
@@ -1199,8 +1205,20 @@ async def _scan_engine(candidates, max_results, msg, flag, label, color,
         async with sem:
             if invalid or limited or len(found) >= max_results:
                 return
-            await asyncio.sleep(speed)
-            result = await check_fn(session, target)
+            result = None
+            for _attempt in range(3):
+                # cooldown partagé : si un autre check a pris un 429, tout le monde attend
+                pause = RATE["until"] - time.time()
+                if not is_vanity and check_fn == check_available and pause > 0:
+                    if pause > MAX_RATE_WAIT:
+                        limited = True
+                        return
+                    await asyncio.sleep(pause + 0.5)
+                await asyncio.sleep(speed)
+                result = await check_fn(session, target)
+                if result == "RATE_LIMITED":
+                    continue          # on attend le cooldown puis on retente ce pseudo
+                break
             if result == "INVALID_TOKEN":
                 invalid = True
                 return
@@ -1238,6 +1256,42 @@ async def _scan_engine(candidates, max_results, msg, flag, label, color,
             await asyncio.gather(*tasks)
 
     return found[:max_results], checked
+
+
+# ── FILE D'ATTENTE GLOBALE ────────────────────────────────────────────────────
+# Un seul USER_TOKEN = un seul quota Discord partagé par tout le monde.
+# Les scans de pseudos passent donc un par un ; les autres attendent leur tour
+# au lieu de se bloquer mutuellement avec des 429.
+MAX_RATE_WAIT = 90          # secondes max qu'on accepte d'attendre un cooldown
+_SCAN_LOCK = None
+_QUEUE_WAITING = 0
+
+
+async def _scan_engine(candidates, max_results, msg, flag, label, color,
+                       check_fn, is_vanity=False, ctx=None, speed=None):
+    global _SCAN_LOCK, _QUEUE_WAITING
+    if is_vanity or check_fn != check_available:
+        return await _scan_engine_inner(candidates, max_results, msg, flag, label, color,
+                                        check_fn, is_vanity, ctx, speed)
+    if _SCAN_LOCK is None:
+        _SCAN_LOCK = asyncio.Lock()
+    if _SCAN_LOCK.locked():
+        _QUEUE_WAITING += 1
+        try:
+            await msg.edit(embed=make_embed("⏳  File d'attente",
+                f"> Un scan est déjà en cours.\n> Tu es n°`{_QUEUE_WAITING}` dans la file — ça démarre tout seul.", C["warn"]))
+        except Exception: pass
+        try:
+            await _SCAN_LOCK.acquire()
+        finally:
+            _QUEUE_WAITING = max(0, _QUEUE_WAITING - 1)
+    else:
+        await _SCAN_LOCK.acquire()
+    try:
+        return await _scan_engine_inner(candidates, max_results, msg, flag, label, color,
+                                        check_fn, is_vanity, ctx, speed)
+    finally:
+        _SCAN_LOCK.release()
 
 
 async def run_scan(ctx, word_list, label, color, flag,
@@ -3318,14 +3372,29 @@ async def cmd_ping(ctx):
 
 @bot.command(name="resetrate")
 async def cmd_resetrate(ctx):
-    """Reset manuel du cooldown 429 sur la route pomelo."""
+    """Reset du cooldown local + test réel auprès de Discord."""
     old = max(0, int(RATE["until"] - time.time()))
     RATE["until"] = 0.0
-    if old > 0:
-        desc = f"> Cooldown de `{old}s` annulé. Tu peux relancer tes scans."
+    # Test réel : un seul check. Si Discord bloque encore, le cooldown revient (limite côté Discord).
+    status = None
+    if USER_TOKEN:
+        try:
+            async with aiohttp.ClientSession() as session:
+                status = await check_available(session, "zq" + "".join(random.choices("abcdefghijklmnopqrstuvwxyz", k=10)))
+        except Exception:
+            status = None
+    remaining = max(0, int(RATE["until"] - time.time()))
+    if status == "INVALID_TOKEN":
+        embed = make_embed("❌  Token invalide", "> `USER_TOKEN` refusé par Discord — vérifie la variable sur Railway.", C["error"])
+    elif status == "RATE_LIMITED" or remaining > 0:
+        embed = make_embed("⏳  Discord bloque encore",
+            f"> Le cooldown local est annulé, mais **Discord** impose encore `{remaining}s`.\n"
+            f"> Cette limite est côté Discord : impossible de la supprimer, il faut attendre.\n"
+            f"> Les scans reprendront tout seuls ensuite.", C["warn"])
     else:
-        desc = "> Aucun cooldown actif — déjà libre."
-    await ctx.send(embed=make_embed("✅  Rate reset", desc, C["check"]))
+        prev = f"Cooldown de `{old}s` annulé. " if old > 0 else ""
+        embed = make_embed("✅  Rate reset", f"> {prev}Discord répond normalement — tu peux relancer tes scans.", C["check"])
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="uptime")
