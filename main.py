@@ -1324,6 +1324,29 @@ async def on_command_error(ctx, error):
 #  🔢 LONGUEUR EXACTE — len3 à len12 (aliases 3c / 3l)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+_VOWELS = set("aeiouy")
+
+def _looks_real(w):
+    """Filtre heuristique anti-bruit pour les mots issus des dicos."""
+    if not any(c in _VOWELS for c in w):
+        return False
+    # lettres doublées impossibles ou triple lettre
+    if any(d in w for d in ("ii", "uu", "yy", "jj", "kk", "qq", "vv", "ww", "xx", "zz", "hh")):
+        return False
+    if any(w[i] == w[i+1] == w[i+2] for i in range(len(w) - 2)):
+        return False
+    # 5 consonnes d'affilée ou 4 voyelles d'affilée = quasi jamais un vrai mot
+    run_c = run_v = 0
+    for c in w:
+        if c in _VOWELS:
+            run_v += 1; run_c = 0
+        else:
+            run_c += 1; run_v = 0
+        if run_c >= 5 or run_v >= 4:
+            return False
+    return True
+
 def _len_cmd(exact):
     async def _inner(ctx, limit: int = MAX_RESULTS):
         if not USER_TOKEN:
@@ -1342,34 +1365,12 @@ def _len_cmd(exact):
             footer=f"scan {exact}C en cours"))
 
         def build():
+            # Mots réels uniquement : dictionnaires FR + EN, longueur exacte,
+            # sans combos ni chaînes aléatoires, avec un filtre anti-faux-mots.
             mixed = ALL_FR + ALL_EN
-            # 1. mots de longueur exacte dans les dicos
-            pool = list({w for w in mixed if len(w) == exact and is_valid(w)})
-            seen = set(pool)
-
-            # 2. combos a+b et b+a de longueur exacte
-            short = [w for w in mixed if 2 <= len(w) <= exact - 2 and is_valid(w)]
-            random.shuffle(short)
-            for a, b in itertools.combinations(short[:500], 2):
-                for combo in (a + b, b + a):
-                    if len(combo) == exact and combo not in seen and is_valid(combo):
-                        pool.append(combo)
-                        seen.add(combo)
-                if len(pool) >= n * 2:
-                    break
-
-            # 3. fallback alphabétique — génère des strings a-z de longueur exacte
-            #    garantit un pool plein même pour len9-12 où les dicos sont creux
-            if len(pool) < n:
-                chars = list("abcdefghijklmnopqrstuvwxyz")
-                attempts = 0
-                while len(pool) < n and attempts < n * 50:
-                    attempts += 1
-                    candidate = "".join(random.choices(chars, k=exact))
-                    if candidate not in seen and is_valid(candidate):
-                        pool.append(candidate)
-                        seen.add(candidate)
-
+            pool = list({w for w in mixed
+                         if len(w) == exact and is_valid(w) and w.isalpha()
+                         and _looks_real(w)})
             random.shuffle(pool)
             return pool[:n]
 
