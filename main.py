@@ -1242,12 +1242,15 @@ async def _scan_engine(candidates, max_results, msg, flag, label, color,
 
 async def run_scan(ctx, word_list, label, color, flag,
                    limit=MAX_RESULTS, min_len=3, max_len=16,
-                   aesthetic=False, leet=False, underscore=False, speed=None):
+                   aesthetic=False, leet=False, underscore=False, speed=None,
+                   n_override=None):
     if not USER_TOKEN:
         await ctx.send(embed=token_missing_embed()); return
     if speed is None: speed = CONFIG["check_delay"]
     limit = max(1, min(limit, 30))
     n = min(max(limit * 6, 30), 200)
+    if n_override:
+        n = max(n, n_override)
     STATS["scans"] += 1
     msg = await ctx.send(embed=make_embed(description=f"```\n⏳  Génération — {label}...\n```", footer="scan en cours"))
     try:
@@ -2221,7 +2224,12 @@ _THEME_SCANS = [
 
 def _theme_cmd(key, label, color, flag):
     async def _inner(ctx, limit: int = MAX_RESULTS):
-        await run_scan(ctx, THEMES[key], label, C[color], flag, limit)
+        # Pool élargi : mots du thème + variantes (aesthetic, leet, underscore)
+        # + combos mot+mot, triplets, suffixes/préfixes chiffres → des centaines
+        # de candidats au lieu de 8-25, donc de vraies chances de trouver du dispo.
+        await run_scan(ctx, THEMES[key], label, C[color], flag, limit,
+                       aesthetic=True, leet=True, underscore=True,
+                       n_override=max(limit * 40, 400))
     return _inner
 
 
